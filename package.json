@@ -1,0 +1,30 @@
+{
+  "name": "@serhaturtis/opencode-crucible",
+  "version": "0.1.0",
+  "description": "Adversarial design loop for opencode: an Architect generates a design, a Falsifier attacks it with evidence-backed findings, and the plugin is the Referee. Ships a TUI status panel.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./server": {
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "import": "./src/tui.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src/tui.ts"
+  ],
+  "scripts": {
+    "build": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --entry-naming server.js",
+    "test": "bun test",
+    "pack": "bun pm pack",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  }
+}
