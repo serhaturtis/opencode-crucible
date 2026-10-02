@@ -49,6 +49,7 @@ import {
   boardClean,
 } from "./core"
 import { PROTOCOL } from "./protocol"
+import { enqueueEvent } from "./events"
 
 const z = tool.schema
 
@@ -82,13 +83,6 @@ const advancing = new Set<string>()
 const chains = new Map<string, Promise<any>>()
 const recoveredDirs = new Set<string>()
 let watchdogSweeper: ReturnType<typeof setInterval> | null = null
-// Bus events are handled off the bus, in arrival order (see the `event` hook).
-let eventQueue: Promise<void> = Promise.resolve()
-
-// Resolves once every event received so far has been handled (tests).
-export function drainEvents() {
-  return eventQueue
-}
 
 // Plugin-level default inactivity window, overridable by a run's `watchdog_ms`.
 function watchdogMs() {
@@ -2610,7 +2604,7 @@ export const server = async (input: any, options?: any) => {
         const job = eventJob(directory, event)
         if (!job) return
         // Handle events off the bus in arrival order to avoid deadlock.
-        eventQueue = eventQueue.then(job).catch(() => {})
+        enqueueEvent(job)
       } catch {
         // never let an event handler reject into the bus
       }

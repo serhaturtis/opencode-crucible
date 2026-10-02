@@ -10,7 +10,14 @@ afterAll(async () => {
   await fs.rm(dataHome, { recursive: true, force: true })
 })
 
-const { server, drainEvents } = await import("../src/server")
+const serverModule = await import("../src/server")
+const { server } = serverModule
+const { drainEvents } = await import("../src/events")
+
+// opencode calls every function the plugin module exports as a plugin factory.
+test("the server module exports only the plugin factory", () => {
+  expect(Object.keys(serverModule)).toEqual(["server"])
+})
 
 // The fake SDK client: failed calls return { error } instead of throwing.
 function makeClient(opts: { promptError?: (args: any) => any; status?: () => any } = {}) {
