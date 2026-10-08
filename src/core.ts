@@ -48,17 +48,6 @@ export const DESTRUCTIVE = [
   /\bchown\s+-R\s+[^\s]+\s+\//i,
   /curl[^|]*\|\s*(ba)?sh/i,
   /wget[^|]*\|\s*(ba)?sh/i,
-  /\bgit\s+push\b/i,
-  /\bgit\s+clean\b[^\n]*(^|\s)-[a-z]*f/i, // git clean -f / -fd (force)
-  /\bgit\s+clean\b[^\n]*--force\b/i,
-  /\bgit\s+reset\s+--hard\b/i,
-  // Discarding the user's uncommitted work in the shared worktree.
-  /\bgit\s+checkout\b[^\n]*\s--(\s|$)/i, // git checkout -- <paths>
-  /\bgit\s+checkout\s+\.(\s|$)/i, // git checkout .
-  /\bgit\s+checkout\b[^\n]*\s(-f|--force)\b/i,
-  /\bgit\s+restore\b(?![^\n]*--staged)/i, // git restore <paths> (worktree)
-  /\bgit\s+restore\b[^\n]*--worktree\b/i,
-  /\bgit\s+stash\s+(drop|clear)\b/i,
   /\bfind\b[^\n]*-delete\b/i,
   /\btruncate\b[^\n]*-s\s*0\b/i,
   /\brm\s+(-{1,2}[a-z-]*\s+)*["']?\.\.?\/?["']?(\s|$)/i, // rm -rf . / ./ / .. / ../
@@ -66,9 +55,19 @@ export const DESTRUCTIVE = [
   /:\(\)\s*\{.*\};:/,
 ]
 
+// The only git a design agent may run: read-only, so it never touches the user's index, branches, worktree or history.
+const READ_ONLY_GIT = new Set(["status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-tree", "rev-parse", "rev-list", "cat-file", "describe", "shortlog", "version", "help"])
+// Each git invocation's subcommand, past global options such as -C <dir> or -c key=value.
+const GIT_CALL = /\bgit((?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*)\s+([\w-]+)/g
+
+export function changesGit(command: string) {
+  for (const m of String(command || "").matchAll(GIT_CALL)) if (!READ_ONLY_GIT.has(m[2])) return true
+  return false
+}
+
 export function isDestructive(command: string) {
   const cmd = String(command || "")
-  return DESTRUCTIVE.some((re) => re.test(cmd))
+  return DESTRUCTIVE.some((re) => re.test(cmd)) || changesGit(cmd)
 }
 
 // True when candidate is base or a descendant of it (path-containment guard).
@@ -136,6 +135,31 @@ export function isCited(finding: any) {
 export function isGating(f: any) {
   if (!GATE_SEVERITIES.has(f?.severity)) return false
   return f.status === "binding" || (f.status === "needs_adjudication" && f.contested === true)
+}
+
+// A blocker/major that waits on the user's ruling: escalated, and held on the board until decided.
+export function awaitsUser(f: any) {
+  if (f?.status !== "needs_adjudication" || !GATE_SEVERITIES.has(f.severity)) return false
+  return f.contested === true || f.action === "needs_adjudication" || f.verification === "disputed"
+}
+
+export function adjudicationWhy(f: any) {
+  const gates = f?.contested ? "; it gates until you decide" : ""
+  if (f?.action === "needs_adjudication") return `the Falsifier asks for your ruling${gates}`
+  if (f?.contested && (f.disposition === "accept_risk" || f.disposition === "wont_fix")) return `the Architect proposes ${f.disposition} on a verified ${f.severity}${gates}`
+  if (f?.contested) return `rebutted without verified evidence${gates}`
+  if (f?.verification === "disputed") return "its evidence is disputed"
+  return "rebutted without verified evidence"
+}
+
+// Why an executable/model_checked claim lacks a recorded strong artifact (null when backed or not required).
+export function unbackedReason(state: any, ev: any): string | null {
+  if (ev?.class !== "executable" && ev?.class !== "model_checked") return null
+  const aid = ev?.artifact_id
+  const rec = aid ? (state?.evidence || []).find((e: any) => e.id === aid) : null
+  if (!rec) return `no recorded evidence artifact${aid ? ` for ${aid}` : ""}`
+  if (!STRONG_EVIDENCE.has(rec.class)) return `${aid} is a ${rec.class || "unclassified"} record, not executable/model-checked evidence`
+  return null
 }
 
 // --- scale model (decomposition, children, traceability, domains) ----------
@@ -482,6 +506,8 @@ export function newState(slug: string, system: string, sessionID: string | undef
     residual: [] as string[],
     escalation: null as any,
     escalations: [] as any[],
+    // Accepted risks of every round (open_findings holds only the latest round's).
+    risks: [] as any[],
     // finding id -> { decision, round }: a user adjudication for that round only.
     adjudications: {} as Record<string, any>,
     rounds_without_new_gate: 0,
@@ -528,6 +554,8 @@ export function newState(slug: string, system: string, sessionID: string | undef
     paused_reason: null,
     stopped_from: null,
     stop_reason: null,
+    // A pending verification pass: { target phase, fixed finding ids, round of the fixes }.
+    verify: null as any,
     created_at: nowIso(),
     updated_at: nowIso(),
   }
@@ -642,20 +670,23 @@ export const FINDING_ACTIONS = new Set(["open", "needs_adjudication"])
 // Downgrade executable/model_checked claims with no strong recorded artifact to hypotheses.
 export function downgradeUnbackedEvidence(state: any, verdict: any) {
   for (const f of verdict?.findings || []) {
-    const cls = f?.evidence?.class
-    if (cls === "executable" || cls === "model_checked") {
-      const aid = f?.evidence?.artifact_id
-      const rec = aid ? (state.evidence || []).find((e: any) => e.id === aid) : null
-      if (!rec || !STRONG_EVIDENCE.has(rec.class)) {
-        f.evidence = f.evidence || {}
-        f.evidence.verification = "hypothesis"
-        f.evidence.note = !rec
-          ? `downgraded: no recorded evidence artifact${aid ? ` for ${aid}` : ""}`
-          : `downgraded: ${aid} is a ${rec.class || "unclassified"} record, not executable/model-checked evidence`
-      }
-    }
+    const why = unbackedReason(state, f?.evidence)
+    if (!why) continue
+    f.evidence.verification = "hypothesis"
+    f.evidence.note = `downgraded: ${why}`
   }
   return verdict
+}
+
+// The next unused F-### id across every round (new findings never reuse an old id).
+export function nextFindingId(state: any) {
+  let max = 0
+  const all = [...Object.values(state?.verdicts || {}).flatMap((v: any) => v?.findings || []), ...(state?.open_findings || [])]
+  for (const f of all) {
+    const m = /^F-(\d+)$/.exec(String(f?.id || ""))
+    if (m) max = Math.max(max, Number(m[1]))
+  }
+  return `F-${String(max + 1).padStart(3, "0")}`
 }
 
 // Structural checks on a submitted verdict (returned so the Falsifier can fix all at once).
@@ -670,6 +701,10 @@ export function verdictProblems(state: any, verdict: any): string[] {
     problems.push(`verdict.design_revision '${verdict.design_revision}' does not match the revision under review '${state.design_revision}'`)
   }
   if (verdict.coverage?.examined != null && !Array.isArray(verdict.coverage.examined)) problems.push("verdict.coverage.examined must be an array")
+  const resolvedIn = new Map<string, number>()
+  for (const h of state?.history || []) for (const id of h.resolved_ids || []) if (!resolvedIn.has(id)) resolvedIn.set(id, h.round)
+  // A user ruling not yet scored into history still marks its finding resolved.
+  for (const f of state?.open_findings || []) if (f.status === "resolved" && f.round < state.round && !resolvedIn.has(f.id)) resolvedIn.set(f.id, f.round)
   const seen = new Set<string>()
   verdict.findings.forEach((f: any, i: number) => {
     const label = f?.id ? `finding '${f.id}'` : `finding #${i + 1}`
@@ -681,6 +716,13 @@ export function verdictProblems(state: any, verdict: any): string[] {
     if (!id) problems.push(`${label} has no id`)
     else if (seen.has(id)) problems.push(`duplicate finding id '${id}'`)
     else seen.add(id)
+    // An id is the finding's identity: reusing a resolved one would read a new issue as a regression.
+    if (resolvedIn.has(id) && !freshEvidenceFor(state, f, state.round)) {
+      problems.push(
+        `${label} reuses the id of a finding resolved in round ${resolvedIn.get(id)}: number a new finding from ${nextFindingId(state)}; ` +
+          `to re-raise the resolved one, cite evidence recorded this round (design_record_evidence) as evidence.artifact_id`,
+      )
+    }
     if (!SEVERITIES.has(f.severity)) problems.push(`${label} has invalid severity '${f.severity}' (blocker|major|minor)`)
     if (f.category != null && !CATEGORIES.has(f.category)) problems.push(`${label} has unknown category '${f.category}' (${[...CATEGORIES].join("|")})`)
     if (f.action != null && !FINDING_ACTIONS.has(f.action)) {
@@ -719,17 +761,15 @@ export function responseProblems(state: any, response: any, initial: boolean): s
       return
     }
     if (!DISPOSITIONS.has(r.disposition)) problems.push(`${label} has invalid disposition '${r.disposition}' (${[...DISPOSITIONS].join("|")})`)
+    // A rebuttal's evidence is held to the same backing rule as a finding's.
+    const why = r.disposition === "rebut" && r.refutation_evidence?.verification === "verified" ? unbackedReason(state, r.refutation_evidence) : null
+    if (why) problems.push(`${label} claims verified ${r.refutation_evidence.class} evidence with ${why}; record it with design_record_evidence and cite its id as refutation_evidence.artifact_id`)
     const id = String(r.finding_id ?? "")
-    if (!open.has(id)) problems.push(`${label} does not name a finding of round ${state.round} (${[...open].join(", ") || "none"})`)
+    if (!open.has(id)) problems.push(`${label} does not name a finding on the board (${[...open].join(", ") || "none"})`)
     else if (seen.has(id)) problems.push(`duplicate response for '${id}'`)
     else seen.add(id)
   })
   return problems
-}
-
-// Was this id resolved in an earlier round?
-function previouslyResolved(state: any, id: string) {
-  return (state?.history || []).some((h: any) => (h.resolved_ids || []).includes(id))
 }
 
 // Does the finding cite an evidence artifact recorded in the given round?
@@ -749,40 +789,126 @@ export function adjudicationFor(state: any, id: string, round: number): string |
 }
 
 // The validation ladder for one verdict finding and the Architect's response.
-export function classifyFinding(state: any, round: number, f: any, resp?: any) {
+export function classifyFinding(state: any, f: any, resp?: any) {
   if (!isCited(f) || !f?.artifact_ref) return { status: "rejected_noise", contested: false }
-  if (!categoryInScope(state, f.category)) return { status: "advisory", contested: false }
-  // A re-raised resolved finding counts as fresh only with evidence recorded this round.
-  const regression = previouslyResolved(state, f.id)
+  // Another subsystem's concern is advisory here, unless it is a verified blocker/major against this design.
+  if (!categoryInScope(state, f.category) && !(isBindingEvidence(f) && GATE_SEVERITIES.has(f.severity))) return { status: "advisory", contested: false }
   let base: string
-  if (regression && !freshEvidenceFor(state, f, round)) base = "needs_adjudication"
-  else if (f.action === "needs_adjudication" || f?.evidence?.verification === "disputed") base = "needs_adjudication"
+  if (f.action === "needs_adjudication" || f?.evidence?.verification === "disputed") base = "needs_adjudication"
   else if (isBindingEvidence(f)) base = "binding"
   else if (isSupportedEvidence(f)) base = "supported"
   else base = "plausible"
+  // The Falsifier put this to the user: the Architect's answer is a proposal until the user rules.
+  if (f.action === "needs_adjudication") return { status: "needs_adjudication", contested: isBindingEvidence(f) && GATE_SEVERITIES.has(f.severity) }
+  const gateWorthy = base === "binding" && GATE_SEVERITIES.has(f.severity)
   const disposition = resp?.disposition
-  if (disposition === "fix" || disposition === "simplify") return { status: "resolved", contested: false }
-  if (disposition === "accept_risk" || disposition === "wont_fix") return { status: "accepted_risk", contested: false }
+  if (disposition === "fix" || disposition === "simplify") {
+    // A root cannot edit a subsystem's design: its fix stays open (gating) so that subsystem is reopened to make it.
+    return delegatesToSubsystem(state, f) ? { status: base, contested: false } : { status: "resolved", contested: false }
+  }
+  if (disposition === "accept_risk" || disposition === "wont_fix") {
+    // Waiving a verified blocker/major is the user's call, not the Architect's.
+    return gateWorthy ? { status: "needs_adjudication", contested: true } : { status: "accepted_risk", contested: false }
+  }
   if (disposition === "rebut") {
-    // A rebut only closes a finding when it is backed by verified evidence.
-    const refuteStrong = STRONG_EVIDENCE.has(resp?.refutation_evidence?.class) && resp?.refutation_evidence?.verification === "verified"
-    if (refuteStrong) return { status: "resolved", contested: false }
-    return { status: "needs_adjudication", contested: base === "binding" && GATE_SEVERITIES.has(f.severity) }
+    // A rebut closes a finding only with verified strong evidence, backed like a finding's.
+    const ev = resp?.refutation_evidence
+    if (STRONG_EVIDENCE.has(ev?.class) && ev?.verification === "verified" && !unbackedReason(state, ev)) return { status: "resolved", contested: false }
+    return { status: "needs_adjudication", contested: gateWorthy }
   }
   return { status: base, contested: false }
+}
+
+// A finding the user ruled stands: from then on an ordinary verified one the Architect must answer.
+function asRatified(f: any) {
+  return { ...f, action: "open", evidence: { ...(f?.evidence || {}), class: "authoritative", verification: "verified" } }
+}
+
+// The user's "reopen": a finding waiting on their ruling becomes a ratified one; any other re-runs the ladder.
+export function reopenStatus(state: any, f: any) {
+  const raw = rawFinding(state, f)
+  const { status } = classifyFinding(state, raw)
+  if (status !== "needs_adjudication") return { status, ratified: false }
+  return { status: classifyFinding(state, asRatified(raw)).status, ratified: true }
+}
+
+// A decompose root's finding aimed at one of its subsystems (fixable only inside that subsystem).
+function delegatesToSubsystem(state: any, f: any) {
+  if (!state?.decompose || state.parent_slug || !f?.subsystem_ref) return false
+  return (state.subsystems || []).some((s: any) => subsystemMatches(s, f.subsystem_ref))
+}
+
+// The verdict form of a stored finding (for re-running the ladder on it).
+export function rawFinding(state: any, f: any) {
+  const raw = (state?.verdicts?.[f.round]?.findings || []).find((x: any) => x.id === f.id)
+  return raw || { ...f, evidence: { class: f.evidence_class, verification: f.verification } }
+}
+
+// A held finding carried into a later round: the user's ruling or the Architect's new answer applies.
+function carryFinding(state: any, f: any, resp: any) {
+  const adj = adjudicationFor(state, f.id, f.round)
+  if (adj === "resolved" || adj === "accepted_risk") return { ...f, status: adj, contested: false, decided_by: "user" }
+  if (!resp && adj !== "binding") return f
+  const raw = rawFinding(state, f)
+  const { status, contested } = classifyFinding(state, adj === "binding" ? asRatified(raw) : raw, resp)
+  return { ...f, status, contested, disposition: resp?.disposition ?? f.disposition }
+}
+
+function riskKey(f: any) {
+  return `${f.id}@${f.round ?? ""}`
+}
+
+// The accepted-risk ledger updated with findings' current statuses (a reopened risk leaves it).
+export function mergeRisks(ledger: any[], findings: any[]) {
+  const out = new Map<string, any>((ledger || []).map((r: any) => [riskKey(r), r]))
+  for (const f of findings || []) {
+    if (f.status !== "accepted_risk") {
+      out.delete(riskKey(f))
+      continue
+    }
+    out.set(riskKey(f), {
+      id: f.id,
+      round: f.round ?? null,
+      severity: f.severity,
+      category: f.category,
+      claim: f.claim,
+      accepted_by: f.decided_by === "user" ? "user" : f.disposition || "user",
+    })
+  }
+  return [...out.values()]
+}
+
+// A child's unresolved findings and accepted risks, compact, for the root's integration review.
+export function looseEnds(child: any) {
+  const item = (f: any, status: string) => ({
+    subsystem: child.namespace || child.slug,
+    id: f.id,
+    severity: f.severity,
+    category: f.category,
+    status,
+    claim: String(f.claim || "").slice(0, 200),
+  })
+  const open = (child.open_findings || []).filter((f: any) => !["resolved", "rejected_noise", "accepted_risk"].includes(f.status))
+  return [...open.map((f: any) => item(f, f.status)), ...mergeRisks(child.risks || [], child.open_findings).map((r: any) => item(r, "accepted_risk"))]
 }
 
 export function applyValidation(state: any, round: number, verdict: any, response: any) {
   const respById: Record<string, any> = {}
   for (const r of response?.responses || []) respById[r.finding_id] = r
   const prevResolved = new Set<string>((state.history || []).flatMap((h: any) => h.resolved_ids || []))
+  const prev: any[] = state.open_findings || []
+  // Accepted risks outlive the round that produced them.
+  state.risks = mergeRisks(state.risks || [], prev)
+  const ids = new Set<string>((verdict?.findings || []).map((f: any) => f.id))
+  // A finding waiting on the user stays on the board until decided, even if not re-raised.
+  const carried = prev.filter((f: any) => f.held && f.round < round && !ids.has(f.id)).map((f: any) => carryFinding(state, f, respById[f.id]))
 
   state.open_findings = (verdict?.findings || []).map((f: any) => {
     const resp = respById[f.id]
-    let { status, contested } = classifyFinding(state, round, f, resp)
-    // A user adjudication for this round wins over the computed status.
+    // A user adjudication for this round wins; "binding" (reopened) leaves the Architect to answer it.
     const adj = adjudicationFor(state, f.id, round)
-    if (adj === "resolved" || adj === "accepted_risk" || adj === "binding") {
+    let { status, contested } = classifyFinding(state, adj === "binding" ? asRatified(f) : f, resp)
+    if (adj === "resolved" || adj === "accepted_risk") {
       status = adj
       contested = false
     }
@@ -804,30 +930,27 @@ export function applyValidation(state: any, round: number, verdict: any, respons
       status,
       contested,
       disposition: resp?.disposition || null,
+      decided_by: adj === "resolved" || adj === "accepted_risk" ? "user" : null,
       regression: prevResolved.has(f.id),
       round,
     }
-  })
+  }).concat(carried)
   return state.open_findings
 }
 
-// Findings that could actually gate convergence (verified, cited, artifact-backed, not quarantined).
-export function isNewGateFinding(f: any, state?: any) {
-  const base =
+// Findings that could actually gate convergence (verified, cited, artifact-backed), including verified
+// ones the Falsifier put to the user or outside the run's domains: they still mean the design was not stable.
+export function isNewGateFinding(f: any) {
+  return (
     GATE_SEVERITIES.has(f?.severity) &&
     isBindingEvidence(f) &&
     isCited(f) &&
-    !!f.artifact_ref &&
-    f?.action !== "needs_adjudication" &&
-    (!state || categoryInScope(state, f?.category))
-  if (!base) return false
-  // A re-raised resolved finding without fresh evidence is not a new validated gate.
-  if (state && previouslyResolved(state, f.id) && !freshEvidenceFor(state, f, state.round)) return false
-  return true
+    !!f.artifact_ref
+  )
 }
 
-export function countNewGate(verdict: any, state?: any) {
-  return (verdict?.findings || []).filter((f: any) => isNewGateFinding(f, state)).length
+export function countNewGate(verdict: any) {
+  return (verdict?.findings || []).filter(isNewGateFinding).length
 }
 
 export function openGate(state: any) {
@@ -850,10 +973,14 @@ export function scoreFor(state: any) {
 
 // The board is clean when no blocker gates, majors are within threshold, and coverage is complete.
 export function boardClean(state: any) {
+  return gateClear(state) && (state.coverage?.gaps || []).length === 0
+}
+
+// No gating blocker, and gating majors within threshold.
+function gateClear(state: any) {
   const openBlockers = state.open_findings.filter((f: any) => f.severity === "blocker" && isGating(f)).length
   const openMajors = state.open_findings.filter((f: any) => f.severity === "major" && isGating(f)).length
-  const coverageComplete = (state.coverage?.gaps || []).length === 0
-  return openBlockers === 0 && openMajors <= state.budgets.majors_threshold && coverageComplete
+  return openBlockers === 0 && openMajors <= state.budgets.majors_threshold
 }
 
 // Pre-decomposition rounds do not count against integration budget or convergence.
@@ -876,12 +1003,12 @@ export function decidePhase(state: any) {
   const clean = boardClean(state)
   const withinBudget = !state.budgets.max_spec_lines || (state.spec_lines || 0) <= state.budgets.max_spec_lines
   const base = integrationBase(state)
+  const recent = (state.history || []).filter((h: any) => (h.round || 0) > base).slice(-state.budgets.k)
+  const settled = recent.length >= state.budgets.k
   // Diminishing returns: exactly one new validated finding per round for k rounds.
-  const recentGates = (state.history || [])
-    .filter((h: any) => (h.round || 0) > base)
-    .slice(-state.budgets.k)
-    .map((h: any) => h.new_validated_gate || 0)
-  const diminishing = recentGates.length >= state.budgets.k && recentGates.every((g: number) => g === 1)
+  const diminishing = settled && recent.every((h: any) => (h.new_validated_gate || 0) === 1)
+  // Minor-only returns: k rounds that found only minors; the minors are the reservations (quiet rounds still await self-cert).
+  const minorOnly = settled && recent.every((h: any) => !h.new_validated_gate && !h.blockers && !h.majors && (h.minors || 0) > 0)
   // A decomposed root accepts only once required subsystems are accepted and all requirements traced.
   const ready =
     clean &&
@@ -899,7 +1026,7 @@ export function decidePhase(state: any) {
   if (ready && selfCert && state.rounds_without_new_gate >= state.budgets.k) return "converged"
 
   // Accepted with reservations: ready and diminishing returns (never when strict).
-  if (allowAccepted && ready && diminishing) {
+  if (allowAccepted && ready && (diminishing || minorOnly)) {
     return "accepted_with_reservations"
   }
 
@@ -916,15 +1043,10 @@ export function recordRound(state: any, response: any, reviewedRevision: string)
   const round = state.round
   const verdict = state.verdicts[round]
   applyValidation(state, round, verdict, response)
-  // A contested finding needs the user's ruling, so surface it.
+  // A finding that needs the user's ruling is surfaced, and held on the board until decided.
   for (const f of state.open_findings) {
-    if (!f.contested) continue
-    addEscalation(state, {
-      requirement_id: f.id,
-      kind: "finding",
-      round,
-      reason: `${f.severity} ${f.id} was rebutted without verified evidence; it gates until you adjudicate it`,
-    })
+    f.held = awaitsUser(f)
+    if (f.held) addEscalation(state, { requirement_id: f.id, kind: "finding", round: f.round, reason: `${f.severity} ${f.id}: ${adjudicationWhy(f)}` })
   }
   // Drop escalations whose finding is no longer present before scoring the round.
   withdrawStaleEscalations(state)
@@ -932,11 +1054,14 @@ export function recordRound(state: any, response: any, reviewedRevision: string)
   for (const [id, a] of Object.entries(state.adjudications || {})) {
     if (a && typeof a === "object" && Number((a as any).round) < round) delete state.adjudications[id]
   }
-  const newGate = countNewGate(verdict, state)
+  const newGate = countNewGate(verdict)
   state.rounds_without_new_gate = newGate === 0 ? (state.rounds_without_new_gate || 0) + 1 : 0
   const gate = openGate(state)
-  const prevGate = state.history.length ? state.history[state.history.length - 1].gate : null
-  state.gate_stall_streak = gate > 0 ? (prevGate !== null && gate >= prevGate ? (state.gate_stall_streak || 0) + 1 : 1) : 0
+  // Progress is the Architect's: findings held over from earlier rounds for the user do not stall it.
+  const roundGate = state.open_findings.filter((f: any) => f.round === round && isGating(f)).length
+  const last = state.history[state.history.length - 1]
+  const prevGate = last ? (last.round_gate ?? last.gate) : null
+  state.gate_stall_streak = roundGate > 0 ? (prevGate !== null && roundGate >= prevGate ? (state.gate_stall_streak || 0) + 1 : 1) : 0
 
   const findings = verdict?.findings || []
   const resolvedIds = state.open_findings.filter((f: any) => f.status === "resolved").map((f: any) => f.id)
@@ -949,6 +1074,7 @@ export function recordRound(state: any, response: any, reviewedRevision: string)
     minors: findings.filter((f: any) => f.severity === "minor").length,
     new_validated_gate: newGate,
     gate,
+    round_gate: roundGate,
     contested: state.open_findings.filter((f: any) => f.contested).length,
     score: scoreFor(state),
     coverage_gaps: [...(state.coverage.gaps || [])],
@@ -957,8 +1083,61 @@ export function recordRound(state: any, response: any, reviewedRevision: string)
     spec_lines: state.spec_lines,
     verdict: verdict?.verdict || "unknown",
   })
-  state.phase = decidePhase(state)
+  state.phase = gateAcceptance(state, decidePhase(state))
   return { newGate, gate, phase: state.phase }
+}
+
+// Verified blockers/majors the Architect closed this round on its own word (fix/simplify).
+export function unverifiedFixes(state: any) {
+  return (state.open_findings || []).filter(
+    (f: any) =>
+      f.status === "resolved" &&
+      f.decided_by !== "user" &&
+      (f.disposition === "fix" || f.disposition === "simplify") &&
+      GATE_SEVERITIES.has(f.severity) &&
+      STRONG_EVIDENCE.has(f.evidence_class) &&
+      f.verification === "verified",
+  )
+}
+
+// An acceptance resting on unverified fixes waits for one Falsifier pass over them.
+export function gateAcceptance(state: any, phase: string) {
+  state.verify = null
+  const ids = unverifiedFixes(state).map((f: any) => f.id)
+  if (!isAcceptedTerminal(phase) || ids.length === 0) return phase
+  state.verify = { target: phase, ids, round: state.round }
+  return "designing"
+}
+
+// The verification verdict settles it: the acceptance stands, or the run goes on (or stops at budget).
+export function settleVerification(state: any) {
+  const target = state.verify?.target
+  state.verify = null
+  if (gateClear(state)) return target
+  return state.round - integrationBase(state) > state.budgets.max_rounds ? "budget_stopped" : "responding"
+}
+
+// After a user ruling on the last scored round: finish a run that now qualifies for acceptance.
+export function rescore(state: any) {
+  const last = state.history?.[state.history.length - 1]
+  if (!last || last.round !== state.round || state.dispatch) return false
+  if (!["designing", "budget_stopped", "no_progress"].includes(state.phase)) return false
+  const next = gateAcceptance(state, decidePhase(state))
+  if (!isAcceptedTerminal(next) && !state.verify) return false
+  state.phase = next
+  state.stop_reason = null
+  return true
+}
+
+// Dimensions the Falsifier examined within the last k rounds (since integration began).
+export function recentlyExamined(state: any) {
+  const from = Math.max(integrationBase(state), state.round - (state.budgets?.k || 1)) + 1
+  const out = new Set<string>()
+  for (const [r, v] of Object.entries(state.verdicts || {}) as [string, any][]) {
+    if (Number(r) < from || Number(r) > state.round) continue
+    for (const d of v?.coverage?.examined || []) out.add(String(d))
+  }
+  return [...out]
 }
 
 function cell(text: any) {
@@ -969,10 +1148,10 @@ export function renderOpenIssues(state: any) {
   const rows = state.open_findings
     .filter((f: any) => !["resolved", "accepted_risk"].includes(f.status))
     .map((f: any) => `| ${f.id} | ${f.severity} | ${f.category} | ${f.status}${f.contested ? " (contested)" : ""} | ${cell(f.claim).slice(0, 120)} |`)
-  // Architect-accepted and user-ratified risks are residual risks too.
-  const risks = state.open_findings
-    .filter((f: any) => f.status === "accepted_risk")
-    .map((f: any) => `| ${f.id} | ${f.severity} | ${f.category} | ${f.disposition || "user"} | ${cell(f.claim).slice(0, 120)} |`)
+  // Architect-accepted and user-ratified risks of every round are residual risks too.
+  const risks = mergeRisks(state.risks || [], state.open_findings).map(
+    (r: any) => `| ${r.id} | ${r.severity} | ${r.category} | ${r.accepted_by} | ${cell(r.claim).slice(0, 120)} |`,
+  )
   const escs: any[] = state.escalations?.length ? state.escalations : state.escalation ? [state.escalation] : []
   return `# Open Issues
 
@@ -1004,7 +1183,7 @@ ${(state.coverage?.gaps || []).length ? state.coverage.gaps.join(", ") : "none"}
 }
 
 export function renderRequirements(state: any) {
-  const rows = state.requirements.items.map((r: any) => `| ${r.id} | ${r.priority} | ${cell(r.text)} | ${cell(r.acceptance)} |`)
+  const rows = state.requirements.items.map((r: any) => `| ${r.id} | ${r.priority} | ${cell(r.text)}${r.amended?.length ? ` (amended v${r.amended.at(-1).version})` : ""} | ${cell(r.acceptance)} |`)
   return `# Requirements (version ${state.requirements.version}, ${state.requirements.frozen ? "frozen" : "draft"})
 
 | ID | Priority | Requirement | Acceptance criteria |
@@ -1049,7 +1228,7 @@ export function summarize(state: any) {
 }
 
 // extras carries plugin-only context: the design directory and effective shell policy.
-export function handoff(state: any, role: string, extras: { designDir?: string; shellPolicy?: string } = {}) {
+export function handoff(state: any, role: string, extras: { designDir?: string; shellPolicy?: string; looseEnds?: any[]; scratchDir?: string } = {}) {
   return {
     run_id: state.run_id,
     slug: state.slug,
@@ -1058,11 +1237,14 @@ export function handoff(state: any, role: string, extras: { designDir?: string; 
     round: state.round,
     design_revision: state.design_revision,
     design_dir: extras.designDir || `docs/design/${state.slug}`,
+    scratch_dir: extras.scratchDir || null,
     requirements: state.requirements,
     // The Falsifier stays independent: it never sees the Architect's rationale.
     decisions: role === "falsifier" ? [] : state.decisions,
     evidence: state.evidence.map((e: any) => ({ id: e.id, class: e.class, command: e.command, digest: e.digest })),
     open_findings: state.open_findings.filter((f: any) => !["resolved", "accepted_risk"].includes(f.status)),
+    // New findings are numbered from here; an old id means a re-raise of that finding.
+    next_finding_id: nextFindingId(state),
     coverage: state.coverage,
     budgets: state.budgets,
     integration_base_round: state.integration_base_round ?? null,
@@ -1084,6 +1266,8 @@ export function handoff(state: any, role: string, extras: { designDir?: string; 
       provides: s.provides || [],
       requires: s.requires || [],
     })),
+    // Subsystems' unresolved/accepted findings: the root's Falsifier otherwise never sees cross-subsystem gaps they left.
+    subsystem_loose_ends: extras.looseEnds || [],
     children: state.children || [],
     waiting_on: state.waiting_on || [],
     traceability: state.traceability || [],

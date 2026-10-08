@@ -1,8 +1,9 @@
 import { tool } from "@opencode-ai/plugin"
 import * as fs from "node:fs/promises"
-import { existsSync, readdirSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
+import { execFileSync } from "node:child_process"
 import {
   SCHEMA_VERSION,
   REQUIRED_DIMENSIONS,
@@ -22,7 +23,6 @@ import {
   verdictProblems,
   responseProblems,
   applyValidation,
-  classifyFinding,
   recordRound,
   beginRound,
   renderOpenIssues,
@@ -47,6 +47,14 @@ import {
   isFindingEscalation,
   withdrawStaleEscalations,
   boardClean,
+  rescore,
+  settleVerification,
+  unverifiedFixes,
+  reopenStatus,
+  awaitsUser,
+  recentlyExamined,
+  adjudicationWhy,
+  looseEnds,
 } from "./core"
 import { PROTOCOL } from "./protocol"
 import { enqueueEvent } from "./events"
@@ -55,8 +63,10 @@ const z = tool.schema
 
 // Crucible plugin: persistence, scheduler, tools, injected agents (pure logic in ./core).
 
-// A dispatched turn is killed only after this much silence (no token, tool call, status, or permission event).
-const WATCHDOG_DEFAULT_MS = 30 * 60 * 1000
+// A dispatched turn is killed only after this much silence (no token, tool call, or status event).
+const WATCHDOG_DEFAULT_MS = 10 * 60 * 1000
+// While a tool call runs (e.g. a long benchmark) silence is expected for longer.
+const TOOL_WATCHDOG_MS = 30 * 60 * 1000
 const WATCHDOG_SWEEP_DEFAULT_MS = 30 * 1000
 const BUSY_GRACE_MS = 5000
 // How often a live turn's activity is written to its run state (for the TUI).
@@ -67,7 +77,6 @@ const WATCHDOG_ACTIVITY_EVENTS = new Set([
   "message.part.updated",
   "session.status",
   "session.compacted",
-  "permission.updated",
   "permission.replied",
 ])
 const SHELL_POLICIES = new Set(["guarded", "allow", "ask"])
@@ -75,9 +84,11 @@ const SHELL_POLICIES = new Set(["guarded", "allow", "ask"])
 // The SDK client and plugin options are shared across opencode instances; calls pass their run's directory explicitly.
 let CLIENT: any = null
 let OPTIONS: any = {}
+// The server's own URL, for API routes the SDK client lacks.
+let SERVER_URL: URL | null = null
 
 // child session id -> the last time it showed activity, plus where its run lives.
-const watchdogs = new Map<string, { last: number; persisted: number; dir: string; slug: string; timeout: number }>()
+const watchdogs = new Map<string, { last: number; persisted: number; dir: string; slug: string; timeout: number; tools: Set<string>; waiting: boolean }>()
 const lastCompacted = new Map<string, number>()
 const advancing = new Set<string>()
 const chains = new Map<string, Promise<any>>()
@@ -280,6 +291,7 @@ function migrate(state: any) {
   state.allowAccepted = state.allowAccepted !== false
   state.escalation = state.escalation ?? null
   state.escalations = state.escalations || (state.escalation ? [state.escalation] : [])
+  state.risks = state.risks || []
   state.adjudications = state.adjudications || {}
   // v5: adjudications are scoped to the round they were made in.
   for (const [id, a] of Object.entries(state.adjudications)) {
@@ -290,6 +302,8 @@ function migrate(state: any) {
   state.paused_reason = state.paused_reason ?? null
   state.stopped_from = state.stopped_from ?? null
   state.stop_reason = state.stop_reason ?? null
+  state.session_policy = state.session_policy || {}
+  state.verify = state.verify ?? null
   state.notes = state.notes || ""
   state.schema_version = SCHEMA_VERSION
   return state
@@ -485,6 +499,9 @@ async function lockForRun(dir: string, slug: string) {
 }
 
 // The run and role of a dispatched child session, or null for any other session.
+// Recent bash runs per dispatched session, so executable evidence is what the agent really ran, not what it typed.
+const shellRuns = new Map<string, Array<{ command: string; output: string; exit: number | null; at: number }>>()
+
 async function callerRun(dir: string, sessionID: string | undefined) {
   if (!sessionID) return null
   for (const r of await boundRunsIn(dir, sessionID)) {
@@ -832,6 +849,39 @@ async function promptReferee(dir: string, sessionId: string | null | undefined, 
   }
 }
 
+// Open a clean decompose root's decomposition hold: auto-ingest a valid manifest, else put it to the user.
+async function holdForDecomposition(dir: string, slug: string, state: any): Promise<boolean> {
+  const rel = relDesignDir(dir, slug)
+  const manifest = await readDecompositionManifest(dir, slug)
+  const { problems: manifestIssues } = manifest ? validateDecomposition(state, slug, manifest) : { problems: ["the Architect has not written decomposition.json"] }
+  if (manifest && manifestIssues.length === 0 && (state.decomposition_mode || "confirm") === "auto") {
+    // Fully automatic: ingest without asking (the caller pumps the children after saving).
+    await ingestDecomposition(dir, slug, state, manifest, false)
+    return true
+  } else if (manifest && manifestIssues.length === 0) {
+    state.phase = "awaiting_decomposition"
+    state.decomposition_ready = true
+    state.decomposition_error = null
+    await notify(dir, `Crucible ${state.slug}: decomposition ready — awaiting your approval`, "warning")
+    await promptReferee(
+      dir,
+      state.session_id,
+      `Crucible run '${state.slug}' has written ${rel}/decomposition.json and is holding in awaiting_decomposition. Read the design, then call the \`question\` tool NOW (do not only describe it) with options Approve / Edit / Cancel. On approval call design_decompose with { slug: "${state.slug}" } (it ingests decomposition.json). If I cancel, leave the run in awaiting_decomposition.`,
+    )
+  } else {
+    state.phase = "awaiting_decomposition"
+    state.decomposition_ready = false
+    state.decomposition_error = manifestIssues
+    await notify(dir, `Crucible ${state.slug}: decomposition needs a manifest (${manifestIssues[0] || "not written"})`, "warning")
+    await promptReferee(
+      dir,
+      state.session_id,
+      `Crucible run '${state.slug}' is holding in awaiting_decomposition but no valid decomposition.json is present (${manifestIssues[0] || "not written"}). Draft ${rel}/decomposition.json from the design, then call the \`question\` tool NOW (Approve / Edit / Cancel) before calling design_decompose with { slug: "${state.slug}" }.`,
+    )
+  }
+  return false
+}
+
 function assertPhase(state: any, allowed: string[]) {
   if (!allowed.includes(state.phase)) {
     throw new Error(`Illegal transition: phase is '${state.phase}', expected one of [${allowed.join(", ")}].`)
@@ -948,7 +998,7 @@ async function notifyEscalations(dir: string, state: any) {
   const lines = pending
     .map((e: any) => {
       const f = isFindingEscalation(e) ? (state.open_findings || []).find((x: any) => x.id === e.requirement_id) : null
-      const detail = f ? `${f.severity} ${f.category}${f.contested ? " (rebutted without verified evidence)" : ""}: ${String(f.claim).slice(0, 140)}` : e.reason
+      const detail = f ? `${f.severity} ${f.category}${f.status === "needs_adjudication" ? ` (${adjudicationWhy(f)})` : ""}: ${String(f.claim).slice(0, 140)}` : e.reason
       return `- [${state.slug}] ${e.requirement_id} (${f ? "finding" : "notice"}): ${detail}`
     })
     .join("\n")
@@ -961,7 +1011,7 @@ async function notifyEscalations(dir: string, state: any) {
       `design_decide with { finding_id, decision: "resolved" | "accepted_risk" | "reopen" }. For a notice (not a finding), ` +
       `offer "Acknowledge" / "Leave for now"; acknowledging calls design_decide with { finding_id: <the id>, decision: ` +
       `"accepted_risk" } and silences it until its situation changes (it does not bypass the gate). Add slug ` +
-      `"${state.slug}" if an id is ambiguous. Do not revise the design yourself.`,
+      `"${state.slug}" if an id is ambiguous. If a ruling changes what a requirement says, amend it with design_amend_requirement. Do not revise the design yourself.`,
   )
 }
 
@@ -969,7 +1019,7 @@ async function notifyEscalations(dir: string, state: any) {
 
 function dispatchPrompt(state: any, role: string, first: boolean, opts: { designDir: string; retry?: boolean; stalled?: boolean }) {
   const terminalTool = role === "architect" ? "design_respond" : "design_submit_verdict"
-  const base = `Crucible ${first ? "dispatch" : "continuation"}. Run slug: ${state.slug}. Round: ${state.round}. Role: ${role}. Current revision: ${state.design_revision}. Working directory: ${opts.designDir}.`
+  const base = `Crucible ${first ? "dispatch" : "continuation"}. Run slug: ${state.slug}. Round: ${state.round}. Role: ${role}. Current revision: ${state.design_revision}. Working directory: ${opts.designDir}. Scratch directory for this run: ${runScratch(state.slug)} (also $CRUCIBLE_SCRATCH); keep evidence scripts and data there.`
   const sub = state.parent_slug
     ? ` You are subsystem '${state.namespace || state.slug}' of root run '${state.parent_slug}'; your requirement ids are namespaced and traceable to the root ledger.`
     : ""
@@ -1001,12 +1051,24 @@ function dispatchPrompt(state: any, role: string, first: boolean, opts: { design
     : opts.retry
       ? ` Your previous attempt was interrupted; continue from where you left off and call ${terminalTool} before ending your turn.`
       : ""
-  return `${base}${sub}${blocked}\n${tail}${simplify}${nudge}`
+  const fixes = (state.verify?.ids || []).map((id: string) => {
+    const f = (state.open_findings || []).find((x: any) => x.id === id)
+    return f ? `${id} (${String(f.claim || "").slice(0, 100)})` : id
+  })
+  const verify =
+    role === "falsifier" && fixes.length
+      ? ` VERIFICATION PASS: the run is ready to ${state.verify.target === "awaiting_decomposition" ? "split into subsystems" : "be accepted"}, but the Architect's round-${state.verify.round} fixes have not been checked: ${fixes.join("; ")}. Check each first and re-raise any that does not hold by its same id, citing evidence recorded this round; report anything else as usual.`
+      : ""
+  const integ =
+    state.decompose && (state.subsystems || []).length && role === "falsifier"
+      ? " The hand-off's subsystem_loose_ends lists the subsystems' unresolved and accepted findings; check each for a cross-subsystem gap the root must close (raise it with subsystem_ref if a subsystem must change)."
+      : ""
+  return `${base}${sub}${blocked}\n${tail}${verify}${integ}${simplify}${nudge}`
 }
 
 function armWatchdog(dir: string, slug: string, childID: string, timeout: number) {
   const now = Date.now()
-  watchdogs.set(childID, { last: now, persisted: now, dir, slug, timeout })
+  watchdogs.set(childID, { last: now, persisted: now, dir, slug, timeout, tools: new Set(), waiting: false })
   startWatchdogSweeper()
 }
 
@@ -1034,6 +1096,14 @@ async function persistHeartbeat(dir: string, slug: string, childID: string) {
   }
 }
 
+// Running tool calls per dispatched child, from part updates.
+function noteTool(childID: string, part: any) {
+  const w = watchdogs.get(childID)
+  if (!w || part?.type !== "tool" || !part.callID) return
+  if (part.state?.status === "pending" || part.state?.status === "running") w.tools.add(part.callID)
+  else w.tools.delete(part.callID)
+}
+
 function clearWatchdog(childID: string) {
   watchdogs.delete(childID)
   if (watchdogs.size === 0) stopWatchdogSweeper()
@@ -1058,7 +1128,8 @@ function stopWatchdogSweeper() {
 async function sweepWatchdogs() {
   const now = Date.now()
   for (const [childID, w] of [...watchdogs]) {
-    if (now - w.last < w.timeout) continue
+    // Waiting on the user's permission is not inactivity; a running tool gets the longer window.
+    if (w.waiting || now - w.last < (w.tools.size ? Math.max(w.timeout, TOOL_WATCHDOG_MS) : w.timeout)) continue
     watchdogs.delete(childID)
     try {
       void withLock(await lockForRun(w.dir, w.slug), async () => {
@@ -1072,8 +1143,63 @@ async function sweepWatchdogs() {
   if (watchdogs.size === 0) stopWatchdogSweeper()
 }
 
+// Kill this user's processes whose environment has the marker (catches detached daemons); SIGTERM, then SIGKILL after 2s.
+// This user's processes whose environment carries the marker (Linux /proc, macOS ps; elsewhere none).
+function markedPids(marker: string): number[] {
+  const pids: number[] = []
+  try {
+    if (process.platform === "linux") {
+      for (const n of readdirSync("/proc")) {
+        if (!/^\d+$/.test(n) || +n === process.pid) continue
+        try {
+          if (readFileSync(`/proc/${n}/environ`, "utf8").split("\0").includes(marker)) pids.push(+n)
+        } catch {
+        }
+      }
+    } else if (process.platform === "darwin") {
+      const out = execFileSync("ps", ["-E", "-ww", "-ax", "-o", "pid=,command="], { encoding: "utf8", maxBuffer: 64 << 20 })
+      for (const line of out.split("\n")) {
+        const pid = parseInt(line.trim(), 10)
+        if (pid && pid !== process.pid && line.split(/\s+/).includes(marker)) pids.push(pid)
+      }
+    }
+  } catch {
+  }
+  return pids
+}
+
+// Containers are started by the daemon and never carry the env marker; remove them by the label the bash hook injects.
+function removeLabelledContainers(key: string, value: string) {
+  for (const bin of ["docker", "podman"]) {
+    try {
+      const ids = execFileSync(bin, ["ps", "-aq", "--filter", `label=${key}=${value}`], { timeout: 10000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\s+/).filter(Boolean)
+      if (ids.length) execFileSync(bin, ["rm", "-f", ...ids], { timeout: 10000, stdio: "ignore" })
+    } catch {
+    }
+  }
+}
+
+// Terminate an agent's leftover processes; survivors are re-found (never a reused pid) and killed after 2s.
+function killMarked(marker: string) {
+  const m = marker.match(/^CRUCIBLE_(SESSION|WORKTREE)=(.*)$/s)
+  if (m) removeLabelledContainers(`crucible.${m[1].toLowerCase()}`, m[2])
+  const send = (pids: number[], sig: NodeJS.Signals) => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, sig)
+      } catch {
+      }
+    }
+  }
+  const pids = markedPids(marker)
+  if (!pids.length) return
+  send(pids, "SIGTERM")
+  setTimeout(() => send(markedPids(marker), "SIGKILL"), 2000).unref?.()
+}
+
 async function abortSession(dir: string, id: string) {
   clearWatchdog(id)
+  killMarked(`CRUCIBLE_SESSION=${id}`)
   try {
     await CLIENT?.session?.abort?.({ path: { id }, query: { directory: dir } })
   } catch {
@@ -1144,7 +1270,7 @@ async function dispatchRole(dir: string, state: any, role: string, retries = 0) 
   if (!childID) {
     const parentID = await refereeSessionId(dir, state)
     const created = await CLIENT.session.create({
-      body: { ...(parentID ? { parentID } : {}), title: `crucible:${state.slug}:${role}` },
+      body: { ...(parentID ? { parentID } : {}), title: `crucible:${state.slug}:${role}`, permission: sessionPermissions(effectiveShellPolicy(state)) },
       query: { directory: dir },
     })
     // The SDK reports HTTP failures in the result instead of throwing.
@@ -1156,7 +1282,18 @@ async function dispatchRole(dir: string, state: any, role: string, retries = 0) 
     await bindSession(dir, childID, state.slug)
     state.managed_sessions = state.managed_sessions || []
     if (!state.managed_sessions.includes(childID)) state.managed_sessions.push(childID)
+    state.session_policy = { ...(state.session_policy || {}), [role]: effectiveShellPolicy(state) }
   }
+  // A reused session gets the current policy's rules (later rules win in opencode).
+  const policy = effectiveShellPolicy(state)
+  if (state.session_policy?.[role] !== policy) {
+    try {
+      await CLIENT.session.update({ path: { id: childID }, body: { permission: sessionPermissions(policy) }, query: { directory: dir } })
+      state.session_policy = { ...(state.session_policy || {}), [role]: policy }
+    } catch {
+    }
+  }
+  await fs.mkdir(runScratch(state.slug), { recursive: true }).catch(() => {})
   const stalled = (state.stall_count || 0) > 0
   state.dispatch = {
     attempt_id: `${state.slug}-${Date.now()}`,
@@ -1340,6 +1477,7 @@ async function onIdle(dir: string, childID: string) {
     if (!advanced && Date.now() - (lastCompacted.get(childID) || 0) < BUSY_GRACE_MS) return
     lastCompacted.delete(childID)
     clearWatchdog(childID)
+    killMarked(`CRUCIBLE_SESSION=${childID}`)
     state.dispatch = null
     state.dispatch_error_count = 0
     if (advanced) state.stall_count = 0
@@ -1370,12 +1508,14 @@ async function onSessionError(dir: string, childID: string, error: any) {
 
 // A managed child session was deleted; forget it and re-drive any in-flight turn.
 async function onSessionDeleted(dir: string, sessionID: string) {
+  shellRuns.delete(sessionID)
   const slug = await resolveSlug(dir, undefined, sessionID)
   if (!slug) return
   await withLock(await lockForRun(dir, slug), async () => {
     const state = await readState(dir, slug)
     if (!state || !(state.managed_sessions || []).includes(sessionID)) return
     clearWatchdog(sessionID)
+    killMarked(`CRUCIBLE_SESSION=${sessionID}`)
     for (const [role, id] of Object.entries(state.sessions || {})) if (id === sessionID) delete state.sessions[role]
     state.managed_sessions = state.managed_sessions.filter((id: string) => id !== sessionID)
     if (state.dispatch?.child_session_id === sessionID) {
@@ -1508,14 +1648,65 @@ function writtenPaths(toolName: string, args: any): string[] {
   return out
 }
 
+// opencode's own temp dir (Global.Path.tmp): the agents' scratch area, allowed for writes and outside-directory access.
+const SCRATCH_DIR = path.join(os.tmpdir(), "opencode")
+const runScratch = (slug: string) => path.join(SCRATCH_DIR, "crucible", slug)
+// Where opencode stores full outputs of truncated tool results, which agents must be able to read.
+const TOOL_OUTPUT_DIR = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "tool-output")
+
+// Child-session permission rules for a shell policy. Unattended policies never leave an "ask": nobody could answer it.
+function sessionPermissions(policy: string) {
+  const prompt = policy === "ask"
+  const outside = policy === "allow" ? "allow" : prompt ? "ask" : "deny"
+  return [
+    { permission: "bash", pattern: "*", action: prompt ? "ask" : "allow" },
+    { permission: "edit", pattern: "*", action: "allow" },
+    { permission: "external_directory", pattern: "*", action: outside },
+    { permission: "external_directory", pattern: path.join(SCRATCH_DIR, "*"), action: "allow" },
+    { permission: "external_directory", pattern: path.join(TOOL_OUTPUT_DIR, "*"), action: "allow" },
+    { permission: "doom_loop", pattern: "*", action: prompt ? "ask" : "deny" },
+    { permission: "read", pattern: "*.env", action: prompt ? "ask" : "deny" },
+    { permission: "read", pattern: "*.env.*", action: prompt ? "ask" : "deny" },
+    { permission: "read", pattern: "*.env.example", action: "allow" },
+  ]
+}
+
+// A prompt raised in a dispatched session: unattended runs reject it at once; "ask" runs wait for the user.
+async function onPermissionAsked(dir: string, p: any) {
+  const sid = p?.sessionID
+  if (!sid || !p?.id) return
+  const caller = await callerRun(dir, sid)
+  if (!caller) return
+  const what = `${p.permission} ${[p.patterns].flat().filter(Boolean).join(" ")}`.trim()
+  if (effectiveShellPolicy(caller.state) === "ask") {
+    const w = watchdogs.get(sid)
+    if (w) w.waiting = true
+    await notify(dir, `Crucible ${caller.slug}: the ${caller.role || "agent"} is waiting for your permission (${what})`, "warning")
+    return
+  }
+  // A rejection with feedback lets the agent continue its turn; a bare one (the fallback) ends it.
+  const feedback = `Refused automatically: this unattended run allows no ${p.permission} prompts. ${p.permission === "external_directory" ? `Work inside the project or ${SCRATCH_DIR} instead.` : "Take another route."} Continue your task.`
+  const replied = await fetch(new URL(`/permission/${p.id}/reply?directory=${encodeURIComponent(dir)}`, SERVER_URL || "http://invalid"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reply: "reject", message: feedback }),
+  }).then((r) => r.ok, () => false)
+  if (!replied) {
+    try {
+      await CLIENT?.postSessionIdPermissionsPermissionId?.({ path: { id: sid, permissionID: p.id }, body: { response: "reject" }, query: { directory: dir } })
+    } catch {
+    }
+  }
+  await notify(dir, `Crucible ${caller.slug}: rejected a ${what} prompt for the ${caller.role || "agent"} (unattended run)`, "info")
+}
+
 // Protocol hard rules for files: state only via design_* tools, writes only inside the run dir.
 function fileGuard(dir: string, caller: { slug: string; role: string | null }, file: string): string | null {
   const abs = path.resolve(dir, file)
-  const root = designRoots(dir).find((r) => withinDir(abs, r))
-  if (!root) return null
-  if (path.relative(root, abs).split(path.sep).includes(".crucible")) return "run state under .crucible/ is written only by the design_* tools."
+  if (withinDir(abs, SCRATCH_DIR)) return null
   const runDir = designDir(dir, caller.slug)
-  if (!withinDir(abs, runDir)) return `the ${caller.role || "agent"} of run '${caller.slug}' may only write inside its own run directory (${relDesignDir(dir, caller.slug)}).`
+  if (!withinDir(abs, runDir)) return `the ${caller.role || "agent"} of run '${caller.slug}' may only write inside its own run directory (${relDesignDir(dir, caller.slug)}) or ${SCRATCH_DIR}.`
+  if (path.relative(runDir, abs).split(path.sep).includes(".crucible")) return "run state under .crucible/ is written only by the design_* tools."
   const name = path.relative(runDir, abs).split(path.sep).join("/")
   if (caller.role === "falsifier" && ((/\.md$/i.test(name) && name !== "07-review-log.md") || name === "decomposition.json")) {
     return "the Falsifier never edits design artifacts; it writes only 07-review-log.md (submit findings with design_submit_verdict)."
@@ -1538,10 +1729,10 @@ const CONFIG_ARGS = {
   m: z.number().int().positive().optional().describe("Rounds of no gate decrease before no_progress."),
   majors_threshold: z.number().int().min(0).optional().describe("Validated majors allowed at acceptance."),
   max_parallel: z.number().int().positive().optional().describe("Max concurrent subsystems (decompose)."),
-  watchdog_ms: z.number().int().positive().optional().describe("Inactivity window for a dispatched agent turn, in ms (default 1800000): a turn is retried only after this much silence, never for taking long."),
+  watchdog_ms: z.number().int().positive().optional().describe("Inactivity window for a dispatched agent turn, in ms (default 600000; at least 30 min while a tool call runs): a turn is retried only after this much silence, never for taking long."),
   architect_model: z.string().optional().describe('provider/model for the Architect ("inherit" clears the override).'),
   falsifier_model: z.string().optional().describe('provider/model for the Falsifier ("inherit" clears the override).'),
-  shell_policy: z.enum(["guarded", "allow", "ask"]).optional().describe("Child-agent shell policy: guarded (no prompts, destructive commands blocked), ask (opencode prompts), allow (no guard)."),
+  shell_policy: z.enum(["guarded", "allow", "ask"]).optional().describe("Child-agent shell policy: guarded (no prompts; outside directories denied except the scratch dir; repeated calls and .env reads denied; a blocklist refuses destructive, remote-affecting, and repository-changing git commands; not a sandbox, so commit first), ask (opencode prompts the user), allow (like guarded, but outside directories allowed)."),
   strict: z.boolean().optional().describe("Disallow accepted_with_reservations (converged only)."),
   decompose: z.boolean().optional().describe("Make this a root run that decomposes into subsystems."),
   decomposition: z.enum(["auto", "confirm"]).optional().describe("When the Architect writes decomposition.json: confirm (ask the user) or auto (ingest without asking)."),
@@ -1756,6 +1947,42 @@ const DESIGN_ADD_REQUIREMENT = tool({
   },
 })
 
+const DESIGN_AMEND_REQUIREMENT = tool({
+  description: "Amend an existing requirement (text, priority and/or acceptance) after a ruling changes what it says. Bumps the ledger version if frozen and keeps the old values in the item's amended history.",
+  args: {
+    slug: z.string().optional(),
+    id: z.string().describe("Existing requirement id."),
+    text: z.string().optional().describe("New requirement statement."),
+    priority: z.enum(["must", "should", "could", "wont"]).optional().describe("New MoSCoW priority."),
+    acceptance: z.string().optional().describe("New acceptance criteria."),
+    reason: z.string().describe("Why, e.g. 'user ruling on F-006'."),
+  },
+  async execute(args, ctx) {
+    return lockedState(
+      ctx.directory,
+      args.slug,
+      ctx.sessionID,
+      async (_slug, state) => {
+        // Rulings land mid-round, so an amendment is legal in any live phase.
+        if (TERMINAL.has(state.phase)) return JSON.stringify({ ok: false, error: `Run is terminal (${state.phase}); the ledger is closed.` }, null, 2)
+        const item = state.requirements.items.find((r: any) => r.id === args.id)
+        if (!item) return JSON.stringify({ ok: false, error: `Unknown requirement id '${args.id}'.` }, null, 2)
+        const fields = ["text", "priority", "acceptance"].filter((k) => (args as any)[k] !== undefined && (args as any)[k] !== item[k])
+        if (!fields.length) return JSON.stringify({ ok: false, error: "Nothing to change: give a different text, priority or acceptance." }, null, 2)
+        if (state.requirements.frozen) state.requirements.version += 1
+        const before = { text: item.text, priority: item.priority, acceptance: item.acceptance }
+        for (const k of fields) item[k] = (args as any)[k]
+        item.amended = [...(item.amended || []), { version: state.requirements.version, at: nowIso(), reason: args.reason, before }]
+        await writeRequirements(ctx.directory, state)
+        await saveState(ctx.directory, state)
+        await afterRunChange(ctx.directory, state)
+        return JSON.stringify({ ok: true, id: item.id, status: summarize(state) }, null, 2)
+      },
+      { tool: "design_amend_requirement", roles: REFEREE_ONLY },
+    )
+  },
+})
+
 const DESIGN_CONFIRM_REQUIREMENTS = tool({
   description: "Freeze the requirement ledger (with a version) and move the run to the design phase.",
   args: { slug: z.string().optional() },
@@ -1805,7 +2032,7 @@ const DESIGN_RECORD_EVIDENCE = tool({
   args: {
     slug: z.string().optional(),
     class: z.enum(["executable", "authoritative", "model_checked", "structured_argument"]).describe("Evidence class."),
-    output: z.string().describe("The observed output, citation text, or the reasoning."),
+    output: z.string().optional().describe("The observed output, citation text, or the reasoning. For a dispatched agent's executable/model_checked evidence the plugin records the captured bash output instead."),
     command: z.string().optional().describe("The command run, for executable/model_checked evidence."),
     exit_code: z.number().int().optional(),
     artifact_ref: z.string().optional().describe("Artifact section this evidence bears on."),
@@ -1817,22 +2044,40 @@ const DESIGN_RECORD_EVIDENCE = tool({
       ctx.sessionID,
       async (slug, state) => {
         if (TERMINAL.has(state.phase) || state.phase === "eliciting" || state.phase === "awaiting_confirmation") return JSON.stringify({ ok: false, error: "No round in progress." }, null, 2)
+        let { output, command, exit_code } = args
+        let captured = false
+        if ((state.managed_sessions || []).includes(ctx.sessionID) && (args.class === "executable" || args.class === "model_checked")) {
+          let runs = shellRuns.get(ctx.sessionID) || []
+          if (state.dispatch?.child_session_id === ctx.sessionID) runs = runs.filter((r) => r.at >= Date.parse(state.dispatch.started_at))
+          const want = args.command?.trim()
+          const run = [...runs].reverse().find((r) => !want || r.command === want)
+          if (!run) {
+            const recent = runs.slice(-5).map((r) => `- ${r.command}`).join("\n")
+            return JSON.stringify({ ok: false, error: `executable/model_checked evidence must come from a command run with the bash tool in this turn. Run it, then record it with the same command.${recent ? `\nCommands run this turn:\n${recent}` : ""}` }, null, 2)
+          }
+          command = run.command
+          output = run.output
+          exit_code = run.exit ?? undefined
+          captured = true
+        }
+        if (!output?.trim()) return JSON.stringify({ ok: false, error: "output is required (nothing was captured for this evidence)." }, null, 2)
         const id = nextId(state, "E-", state.evidence)
         const rec = {
           id,
           class: args.class,
-          command: args.command || null,
-          exit_code: args.exit_code ?? null,
-          digest: digest(args.output),
-          output_preview: String(args.output).slice(0, 2000),
+          command: command || null,
+          exit_code: exit_code ?? null,
+          captured,
+          digest: digest(output),
+          output_preview: String(output).slice(0, 2000),
           artifact_ref: args.artifact_ref || null,
           round: state.round,
           at: nowIso(),
         }
         state.evidence.push(rec)
-        await writeJsonAtomic(path.join(designDir(ctx.directory, slug), ".crucible", "evidence", `${id}.json`), { ...rec, output: args.output })
+        await writeJsonAtomic(path.join(designDir(ctx.directory, slug), ".crucible", "evidence", `${id}.json`), { ...rec, output })
         await saveState(ctx.directory, state)
-        return JSON.stringify({ ok: true, id, digest: rec.digest, status: summarize(state) }, null, 2)
+        return JSON.stringify({ ok: true, id, captured, digest: rec.digest, status: summarize(state) }, null, 2)
       },
       { tool: "design_record_evidence", roles: ["architect", "falsifier"] },
     )
@@ -1895,21 +2140,34 @@ const DESIGN_SUBMIT_VERDICT = tool({
         const round = state.round
         state.verdicts[round] = verdict
         await writeJsonAtomic(path.join(designDir(ctx.directory, slug), ".crucible", "verdicts", `round-${String(round).padStart(2, "0")}.json`), verdict)
-        state.coverage.examined = [...new Set<string>([...(state.coverage.examined || []), ...(verdict?.coverage?.examined || [])])]
+        state.coverage.examined = recentlyExamined(state)
         refreshCoverage(state)
         // Classify now so status, gate, and parent blocks read the ladder's result.
         applyValidation(state, round, verdict, null)
         // The previous round's finding escalations are moot now.
         withdrawStaleEscalations(state)
-        // Every gate-worthy requirement_gap escalates to the user.
+        // Put the user's questions to them now, while the Architect works: rulings the Falsifier asked for and gate-worthy gaps.
         for (const f of state.open_findings) {
-          if (f.category !== "requirement_gap" || !GATE_SEVERITIES.has(f.severity) || f.status === "rejected_noise") continue
-          addEscalation(state, { requirement_id: f.id, kind: "finding", round, reason: `requirement_gap finding '${f.id}' needs user ratification` })
+          if (f.round !== round || f.status === "rejected_noise") continue
+          if (awaitsUser(f)) addEscalation(state, { requirement_id: f.id, kind: "finding", round, reason: `${f.severity} ${f.id}: ${adjudicationWhy(f)}` })
+          else if (f.category === "requirement_gap" && GATE_SEVERITIES.has(f.severity)) {
+            addEscalation(state, { requirement_id: f.id, kind: "finding", round, reason: `requirement_gap finding '${f.id}' needs user ratification` })
+          }
         }
         await notifyEscalations(ctx.directory, state)
         state.phase = "responding"
+        // A verification pass settles the pending acceptance without another Architect turn.
+        if (state.verify) {
+          state.phase = settleVerification(state)
+          if (state.phase === "budget_stopped") state.stop_reason = "fix_not_verified"
+        }
+        // A clean verification of a decompose root's own design opens its decomposition hold.
+        const ingested = state.phase === "awaiting_decomposition" && (await holdForDecomposition(ctx.directory, slug, state))
         await propagateBlocks(ctx.directory, state, false)
+        await finalizeTerminal(ctx.directory, state)
         await saveState(ctx.directory, state)
+        if (ingested) await pumpChildren(ctx.directory, slug)
+        if (TERMINAL.has(state.phase)) await afterRunChange(ctx.directory, state)
         return JSON.stringify({ ok: true, round, findings: state.open_findings.length, coverage_gaps: state.coverage.gaps, status: summarize(state) }, null, 2)
       },
       { tool: "design_submit_verdict", roles: ["falsifier"] },
@@ -1973,34 +2231,10 @@ const DESIGN_RESPOND = tool({
           const withinBudget = !state.budgets.max_spec_lines || (state.spec_lines || 0) <= state.budgets.max_spec_lines
           const gateClean = boardClean(state) && withinBudget
           if (gateClean && !isAcceptedTerminal(state.phase)) {
-            const rel = relDesignDir(ctx.directory, slug)
-            const manifest = await readDecompositionManifest(ctx.directory, slug)
-            const { problems: manifestIssues } = manifest ? validateDecomposition(state, slug, manifest) : { problems: ["the Architect has not written decomposition.json"] }
-            if (manifest && manifestIssues.length === 0 && (state.decomposition_mode || "confirm") === "auto") {
-              // Fully automatic: ingest without asking (pumped after the save below).
-              await ingestDecomposition(ctx.directory, slug, state, manifest, false)
-              ingested = true
-            } else if (manifest && manifestIssues.length === 0) {
-              state.phase = "awaiting_decomposition"
-              state.decomposition_ready = true
-              state.decomposition_error = null
-              await notify(ctx.directory, `Crucible ${state.slug}: decomposition ready — awaiting your approval`, "warning")
-              await promptReferee(
-                ctx.directory,
-                state.session_id,
-                `Crucible run '${state.slug}' has written ${rel}/decomposition.json and is holding in awaiting_decomposition. Read the design, then call the \`question\` tool NOW (do not only describe it) with options Approve / Edit / Cancel. On approval call design_decompose with { slug: "${state.slug}" } (it ingests decomposition.json). If I cancel, leave the run in awaiting_decomposition.`,
-              )
-            } else {
-              state.phase = "awaiting_decomposition"
-              state.decomposition_ready = false
-              state.decomposition_error = manifestIssues
-              await notify(ctx.directory, `Crucible ${state.slug}: decomposition needs a manifest (${manifestIssues[0] || "not written"})`, "warning")
-              await promptReferee(
-                ctx.directory,
-                state.session_id,
-                `Crucible run '${state.slug}' is holding in awaiting_decomposition but no valid decomposition.json is present (${manifestIssues[0] || "not written"}). Draft ${rel}/decomposition.json from the design, then call the \`question\` tool NOW (Approve / Edit / Cancel) before calling design_decompose with { slug: "${state.slug}" }.`,
-              )
-            }
+            // Subsystems are designed on top of this: fixes the Falsifier has not seen get one pass first.
+            const fixes = unverifiedFixes(state).map((f: any) => f.id)
+            if (fixes.length) state.verify = { target: "awaiting_decomposition", ids: fixes, round: state.round }
+            else ingested = await holdForDecomposition(ctx.directory, slug, state)
           }
         }
         await notifyEscalations(ctx.directory, state)
@@ -2120,7 +2354,7 @@ const DESIGN_ESCALATIONS = tool({
           paused: st.paused === true,
           kind: findingLinked ? "finding" : "notice",
           escalation: e,
-          finding: f ? { id: f.id, severity: f.severity, category: f.category, status: f.status, contested: f.contested === true, claim: f.claim } : null,
+          finding: f ? { id: f.id, severity: f.severity, category: f.category, status: f.status, contested: f.contested === true, architect: f.disposition || null, claim: f.claim } : null,
           // The escalation references a finding id that no longer exists; clearing it is enough.
           stale: findingLinked && !f,
         })
@@ -2199,17 +2433,18 @@ const DESIGN_DECIDE = tool({
       state.adjudications = state.adjudications || {}
       const round = finding.round ?? state.round
       if (args.decision === "reopen") {
-        // Reopen: drop the override and re-run the ladder.
-        delete state.adjudications[args.finding_id]
-        const raw = (state.verdicts?.[round]?.findings || []).find((f: any) => f.id === args.finding_id)
-        const strong = ["executable", "authoritative", "model_checked"].includes(finding.evidence_class) && finding.verification === "verified"
-        const cls = raw ? classifyFinding(state, round, raw) : { status: strong ? "binding" : "plausible", contested: false }
-        finding.status = cls.status
-        finding.contested = cls.contested
+        // Reopen: a finding waiting on the user now stands (and stays so for the Architect); others re-run the ladder.
+        const { status, ratified } = reopenStatus(state, finding)
+        if (ratified) state.adjudications[args.finding_id] = { decision: "binding", round }
+        else delete state.adjudications[args.finding_id]
+        finding.status = status
+        finding.contested = false
+        finding.decided_by = null
       } else {
         finding.status = args.decision
         finding.contested = false
-        // Persist so a later Architect response in this round cannot undo it.
+        finding.decided_by = "user"
+        // Persist so a later Architect response cannot undo it.
         state.adjudications[args.finding_id] = { decision: args.decision, round }
       }
       finding.decision_rationale = args.rationale || ""
@@ -2217,10 +2452,15 @@ const DESIGN_DECIDE = tool({
       removeEscalation(state, args.finding_id)
       // A root's subsystem blocks follow the adjudicated status.
       const reopened = await propagateBlocks(ctx.directory, state, true)
-      if (TERMINAL.has(state.phase)) await writeOpenIssues(ctx.directory, state)
+      // The ruling may be all the last scored round was waiting for.
+      const changed = rescore(state)
+      if (changed && TERMINAL.has(state.phase)) await finalizeTerminal(ctx.directory, state)
+      else if (TERMINAL.has(state.phase)) await writeOpenIssues(ctx.directory, state)
       await saveState(ctx.directory, state)
       for (const s of reopened) await advance(ctx.directory, s)
-      if (state.phase === "responding" && !state.dispatch) await advance(ctx.directory, slug)
+      if (changed) await afterRunChange(ctx.directory, state)
+      // A run that now awaits a verification pass (or its Architect) is driven on.
+      if ((state.phase === "responding" || (changed && state.verify)) && !state.dispatch) await advance(ctx.directory, slug)
       return JSON.stringify({ ok: true, slug, finding, status: summarize(state) }, null, 2)
     })
   },
@@ -2301,6 +2541,11 @@ const DESIGN_LIST = tool({
   },
 })
 
+async function rootLooseEnds(dir: string, root: any) {
+  const kids = await Promise.all(root.subsystems.map((s: any) => readState(dir, childSlug(root, s)).catch(() => null)))
+  return kids.filter(Boolean).flatMap((c: any) => looseEnds(c))
+}
+
 const DESIGN_GET_CONTEXT = tool({
   description: "Return the hand-off payload for an agent role (architect|falsifier).",
   args: { slug: z.string().optional(), role: z.enum(["architect", "falsifier"]).optional() },
@@ -2310,7 +2555,8 @@ const DESIGN_GET_CONTEXT = tool({
     let role: "architect" | "falsifier" = args.role || "architect"
     if (state.sessions?.architect === ctx.sessionID) role = "architect"
     else if (state.sessions?.falsifier === ctx.sessionID) role = "falsifier"
-    return JSON.stringify(handoff(state, role, { designDir: relDesignDir(ctx.directory, slug), shellPolicy: effectiveShellPolicy(state) }), null, 2)
+    const loose = state.decompose && !state.parent_slug && state.subsystems.length ? await rootLooseEnds(ctx.directory, state) : undefined
+    return JSON.stringify(handoff(state, role, { designDir: relDesignDir(ctx.directory, slug), shellPolicy: effectiveShellPolicy(state), looseEnds: loose, scratchDir: runScratch(slug) }), null, 2)
   },
 })
 
@@ -2466,34 +2712,34 @@ A dispatch message gives you a run slug, round, and working directory (the run's
 Then call design_get_context with { slug, role: "architect" } to get the requirements, decisions, evidence, and open findings.
 Record each meaningful design choice with design_record_decision (decision, rationale, alternatives); to reverse a prior decision, call it with supersedes set to that decision's id. You may also include a decisions array in your response.
 If the run has no design revision yet (round 0, no open findings), create the design artifacts in the working directory (at least 03-architecture.md, 04-decisions.md, 05-risks.md, 06-operability.md), trace every requirement id, and call design_respond with response_json {"round":0,"design_revision":"v1","responses":[]}.
-Otherwise, for each open finding choose fix | rebut | accept_risk | simplify | wont_fix, revise the artifacts on disk, and call design_respond with response_json {"round":<round>,"design_revision":"v<next>","responses":[{"finding_id","disposition","rationale","artifact_change"}]}. Answer only findings of the current round, by their exact ids. Try to refute a finding before accepting it; for a rebut, supply refutation_evidence {class, verification:"verified", detail} and, when the claim is checkable, record the check first with design_record_evidence. A rebut without verified strong evidence does not close a gating finding: it keeps gating and goes to the user for adjudication.
+Otherwise, for each open finding choose fix | rebut | accept_risk | simplify | wont_fix, revise the artifacts on disk, and call design_respond with response_json {"round":<round>,"design_revision":"v<next>","responses":[{"finding_id","disposition","rationale","artifact_change"}]}. On a decompose root, a finding with subsystem_ref can only be fixed inside that subsystem: describe the needed change; the plugin reopens the subsystem with it. Answer the open findings in the hand-off by their exact ids (these may include findings held from earlier rounds). Try to refute a finding before accepting it; for a rebut, supply refutation_evidence {class, verification:"verified", detail} and, when the claim is checkable, record the check first with design_record_evidence (run the command with bash this turn, then record it with the same command) and cite its id as refutation_evidence.artifact_id (required for executable/model_checked). A rebut without verified strong evidence does not close a gating finding: it keeps gating and goes to the user for adjudication. Any server or background process you start for evidence (e.g. a database under the run's scratch directory, $CRUCIBLE_SCRATCH) must be stopped before you end your turn (the plugin also kills leftovers at the end of your turn). Containers started with docker or podman run are removed then too; prefer --rm. Use only read-only git (status, log, diff, show); never commit, stage, switch branches or stash, because the user owns the repository.
 Minimalism: prefer the smallest change that resolves a finding; reuse existing code and prior decisions; do not add a mechanism, option, or document section that no requirement demands. If a finding asks for disproportionate complexity, use disposition "simplify" (remove or reduce) or "wont_fix" (a justified deliberate non-fix) instead of adding machinery. Each round, also look for something to remove or simplify. Keep the design within the spec-size budget shown in the dispatch/handoff.
 If this run is a decompose root and your own design has no gating finding, full coverage, and is within the spec-size budget, ALSO write decomposition.json in the working directory so the run can split automatically: {"version":1,"system_slug":"<slug>","max_parallel":<int>,"subsystems":[{"name","namespace":"UPPERTOKEN","title","required":true,"depends_on":[],"domains":[],"requirements":[{"id":"<NS>-R-001","text","priority","acceptance","system_reqs":["R-00x"]}],"provides":[],"requires":[]}],"interfaces":[{"from","to","contract","system_reqs":[]}],"traceability":[{"system_req":"R-00x","subsystems":[],"subsystem_reqs":[]}]}. Rules: subsystem names must stay distinct once lowercased/slugified and namespaces must be unique; requirement ids are namespaced (<NS>-R-###) and unique; system_reqs cite only must/should system requirements; every system must/should requirement appears in traceability with subsystem_reqs naming real subsystem requirement ids; every "requires" contract is "provides"d by a sibling AND declared by an interfaces entry {"from": provider, "to": consumer, "contract": the same string}, and each interface's contract must appear in its from.provides and to.requires. The plugin ingests it automatically (or asks the user first, per the run's decomposition setting).
-Do not write state or verdict/response JSON files yourself, and do not edit 00-brief.md, 01-requirements.md (plugin-owned) or 07-review-log.md (the Falsifier's); the design_* tools persist everything. Call the required tool before ending your turn.`
+Do not write state or verdict/response JSON files yourself; write files only in the working directory (scratch files in the run's scratch directory, $CRUCIBLE_SCRATCH), and do not edit 00-brief.md, 01-requirements.md (plugin-owned) or 07-review-log.md (the Falsifier's); the design_* tools persist everything. Call the required tool before ending your turn.`
 
 const FALSIFIER_PROMPT = `You are the Crucible Falsifier (discriminator) in an adversarial design loop.
 A dispatch message gives you a run slug, round, and working directory (the run's design directory). Before acting, call design_protocol (no arguments) to load the protocol.
 Then call design_get_context with { slug, role: "falsifier" }.
 Adversarially search for reasons the design fails: requirement gaps, contradictions, ambiguity, and concrete failure scenarios. Use the shell to ground claims when possible.
-For every executable or model_checked claim, first call design_record_evidence (class, command, output, exit_code) and put the returned id in the finding's evidence.artifact_id. Findings without a recorded executable/model_checked/authoritative artifact are downgraded and will not gate convergence.
-Every finding needs a unique id (F-001, F-002, ...), a severity (blocker | major | minor), a category, a concrete counterexample, a requirement/constraint citation (requirement_ids or constraint_ref), an artifact_ref, and evidence {class, verification}. verification is one of hypothesis | supported | verified | disputed; use verified only when you have a recorded artifact or authoritative citation. action is "open" (default) or "needs_adjudication". Do not re-raise resolved findings without new evidence. Do not inflate severity.
+For every executable or model_checked claim, first run the command with the bash tool this turn, then call design_record_evidence (class, same command; the plugin captures the real output and exit code) and put the returned id in the finding's evidence.artifact_id. Findings without a recorded executable/model_checked/authoritative artifact are downgraded and will not gate convergence. Any server or background process you start for evidence (e.g. a database under the run's scratch directory, $CRUCIBLE_SCRATCH) must be stopped before you end your turn (the plugin also kills leftovers at the end of your turn). Containers started with docker or podman run are removed then too; prefer --rm. Use only read-only git (status, log, diff, show); never commit, stage, switch branches or stash, because the user owns the repository.
+Every finding needs a unique id (number new findings from next_finding_id in the hand-off; an old id re-raises that finding, and a resolved one needs evidence recorded this round), a severity (blocker | major | minor), a category, a concrete counterexample, a requirement/constraint citation (requirement_ids or constraint_ref), an artifact_ref, and evidence {class, verification}. verification is one of hypothesis | supported | verified | disputed; use verified only when you have a recorded artifact or authoritative citation. action is "open" (default) or "needs_adjudication". Use needs_adjudication to put a question only the user can settle (e.g. a contradiction between requirements): the user is asked at once, and the Architect cannot close it alone. Do not inflate severity. When a gap must be fixed inside a subsystem, set subsystem_ref on the finding.
 Findings must be worth their cost: weigh severity and real risk against the complexity a fix would require, and do not demand disproportionate mechanism. Prioritize requirement gaps and concrete failure/risk over meta or internal-consistency nits, and cap those. It is valid to record a reservation as a minor finding rather than demand a change. If the design is over its spec-size budget, prioritize changes that remove or simplify.
-Never edit the design artifacts. Append a short summary and the findings to 07-review-log.md in the working directory.
-Then call design_submit_verdict with verdict_json = the full verdict object (round, design_revision, verdict, summary, findings[], coverage{dimensions,examined,gaps}, no_new_falsifiable_claim). If it reports problems, fix them and submit again. Call the tool before ending your turn; the tool persists state.`
+Never edit the design artifacts or other project files. Write only 07-review-log.md in the working directory (append a short summary and the findings), plus scratch files in the run's scratch directory ($CRUCIBLE_SCRATCH).
+Then call design_submit_verdict with verdict_json = the full verdict object (round, design_revision, verdict, summary, findings[], coverage{dimensions,examined (what you examined this round),gaps}, no_new_falsifiable_claim). If it reports problems, fix them and submit again. Call the tool before ending your turn; the tool persists state.`
 
 const REFEREE_PROMPT = `You are the Crucible Referee. You run the adversarial design loop; you never design and never attack.
 Call design_protocol first to load the protocol.
 Elicit narrowly: capture the must-have requirements first and keep the brief minimal; add should/could requirements only if the user asks for them. A smaller, well-scoped design converges better than a broad one.
 The brief, the requirements, and the settings are all PER RUN. When the user wants a system designed:
-0. DRAFT THE BRIEF YOURSELF. Most users give a vague prompt; you have the conversation context. Compose a coherent brief: problem, goals, non-goals, stakeholders, and an explicit scope boundary (what is in and out for this run). If the user has no system in mind, propose 2-3 candidate systems first. Show the draft with the question tool (Approve / Edit / Regenerate) and incorporate edits.
+0. DRAFT THE BRIEF YOURSELF. Most users give a vague prompt; you have the conversation context. Compose a coherent brief: problem, goals, non-goals, stakeholders, and an explicit scope boundary (what is in and out for this run). If the user has no system in mind, propose 2-3 candidate systems first. Show the draft with the question tool (Approve / Edit / Regenerate) and incorporate edits; put the full drafted brief and requirement seed inside the question text itself, since the user may only see the question dialog.
 1. Draft a MUST-ONLY requirement seed (5-8 items, each with acceptance criteria) from the brief. Show it with the brief.
-2. Configure the run with the \`question\` tool (do not silently assume settings). Ask, as one form: effort preset (fast/standard/deep/exhaustive); decomposition (should the run be a root that splits into subsystem runs? yes/no — and if yes, whether to auto-ingest the Architect's split or confirm it with you); strictness (balanced/strict); models for the Architect and Falsifier (inherit, or provider/model — omit the argument or pass "inherit" to keep the default); shell policy (guarded/ask/allow); and, only if the user wants custom budgets, the round limit and spec-line limit. Show the resolved configuration and confirm.
+2. Configure the run with the \`question\` tool (do not silently assume settings). Ask, as one form: effort preset (fast/standard/deep/exhaustive); decomposition (should the run be a root that splits into subsystem runs? yes/no — and if yes, whether to auto-ingest the Architect's split or confirm it with you); strictness (balanced/strict); models for the Architect and Falsifier (inherit, or provider/model — omit the argument or pass "inherit" to keep the default; recommend different models, ideally from different providers, since the Falsifier is strongest when it does not share the Architect's blind spots); shell policy (guarded/ask/allow; guarded runs without prompts and is not a sandbox, so suggest the user commit before the run starts); and, only if the user wants custom budgets, the round limit and spec-line limit. Show the resolved configuration and confirm.
 3. Call design_start with the system name, the approved brief, the requirements seed, and the chosen settings (preset, decompose, decomposition, domains, max_parallel, max_rounds, max_spec_lines, k, m, majors_threshold, architect_model, falsifier_model, shell_policy, strict).
 4. Refine requirements with the user if needed (the seed may already cover the musts); present the ledger and ask the user to confirm or amend, then end your turn.
 5. After confirmation, call design_confirm_requirements, then design_dispatch to run the loop (architect and falsifier in child sessions).
 5b. When a decompose root is in awaiting_decomposition and the plugin tells you the decomposition is ready (the Architect has written decomposition.json in the run's design directory), read it and the design, present the proposed decomposition to the user with the question tool (Approve / Edit / Cancel), and on approval call design_decompose with only the slug (it ingests the file). If the file is missing or invalid (design_status shows the problems), draft or fix the manifest from the design, write it there, then present and ingest it. With decomposition_mode 'auto' it is ingested without asking. The subsystem runs then start automatically (up to max_parallel); report again when the root has run its integration round.
 6. Use design_status to report; pause/resume/stop on request; design_config to view or adjust a non-terminal run's settings; design_escalations to list what needs the user's ratification (root and subsystems) and design_decide to adjudicate a finding (it finds the finding across the effort).
-6b. Whenever the plugin tells you a run needs the user (a pending escalation) or that a decomposition is ready for approval, you MUST call the \`question\` tool with the choices given — never only describe them in text. For a finding escalation, offer "Ratify as resolved" / "Accept the risk" / "Reopen" / "Leave for now" per item and call design_decide for the chosen action; for a notice (spec budget, traceability, interface, decision churn, subsystem rejection), offer "Acknowledge" / "Leave for now" and acknowledge with design_decide decision "accepted_risk". Do not revise the design yourself.
+6b. Whenever the plugin tells you a run needs the user (a pending escalation) or that a decomposition is ready for approval, you MUST call the \`question\` tool with the choices given — never only describe them in text. For a finding escalation, offer "Ratify as resolved" / "Accept the risk" / "Reopen" / "Leave for now" per item and call design_decide for the chosen action; for a notice (spec budget, traceability, interface, decision churn, subsystem rejection), offer "Acknowledge" / "Leave for now" and acknowledge with design_decide decision "accepted_risk". After deciding a finding whose ruling changes a requirement's meaning, call design_amend_requirement with the new text and the ruling as reason. Do not revise the design yourself.
 7. At a terminal phase, summarize: convergence status, design directory, decisions, coverage, accepted and residual risks (see 08-open-issues.md).
 Keep reports compact (tables), and never impersonate the architect or falsifier.`
 
@@ -2532,6 +2778,7 @@ function eventJob(dir: string, event: any): (() => Promise<void>) | null {
 export const server = async (input: any, options?: any) => {
   CLIENT = input?.client
   OPTIONS = options || {}
+  SERVER_URL = input?.serverUrl ? new URL(String(input.serverUrl)) : null
   // This instance's worktree, used by hooks (one process may host several instances).
   const directory = path.resolve(input?.directory || process.cwd())
   let disposed = false
@@ -2576,6 +2823,7 @@ export const server = async (input: any, options?: any) => {
       design_start: DESIGN_START,
       design_config: DESIGN_CONFIG,
       design_add_requirement: DESIGN_ADD_REQUIREMENT,
+      design_amend_requirement: DESIGN_AMEND_REQUIREMENT,
       design_confirm_requirements: DESIGN_CONFIRM_REQUIREMENTS,
       design_begin_round: DESIGN_BEGIN_ROUND,
       design_record_evidence: DESIGN_RECORD_EVIDENCE,
@@ -2600,6 +2848,12 @@ export const server = async (input: any, options?: any) => {
         const sid = eventSessionID(event)
         // Real work from a dispatched child resets its inactivity window.
         if (sid && WATCHDOG_ACTIVITY_EVENTS.has(event.type)) touchWatchdog(sid)
+        if (sid && event.type === "message.part.updated") noteTool(sid, event.properties?.part)
+        if (event.type === "permission.asked") enqueueEvent(() => onPermissionAsked(directory, event.properties))
+        if (sid && event.type === "permission.replied") {
+          const w = watchdogs.get(sid)
+          if (w) w.waiting = false
+        }
         if (sid && event.type === "session.compacted") lastCompacted.set(sid, Date.now())
         const job = eventJob(directory, event)
         if (!job) return
@@ -2607,6 +2861,29 @@ export const server = async (input: any, options?: any) => {
         enqueueEvent(job)
       } catch {
         // never let an event handler reject into the bus
+      }
+    },
+
+    // Mark every process a dispatched agent starts so killMarked can reap it (daemons escape process groups).
+    async "shell.env"(input: any, output: any) {
+      try {
+        const caller = input?.sessionID ? await callerRun(directory, input.sessionID) : null
+        if (!caller) return
+        output.env.CRUCIBLE_SESSION = input.sessionID
+        output.env.CRUCIBLE_WORKTREE = directory
+        output.env.CRUCIBLE_SCRATCH = runScratch(caller.slug)
+      } catch {
+      }
+    },
+
+    async "tool.execute.after"(input: any, output: any) {
+      try {
+        if (String(input?.tool).toLowerCase() !== "bash" || !(await callerRun(directory, input.sessionID))) return
+        const runs = shellRuns.get(input.sessionID) || []
+        runs.push({ command: String(input.args?.command ?? "").trim(), output: String(output?.output ?? ""), exit: typeof output?.metadata?.exit === "number" ? output.metadata.exit : null, at: Date.now() })
+        shellRuns.set(input.sessionID, runs.slice(-20))
+      } catch {
+        // never throw from a hook
       }
     },
 
@@ -2622,9 +2899,15 @@ export const server = async (input: any, options?: any) => {
         const caller = await callerRun(directory, sid)
         if (!caller) return
         if (shell) {
+          // Label containers so cleanup can find them (the daemon, not the shell, starts them).
+          const c = output?.args?.command
+          if (typeof c === "string") {
+            const labels = `--label crucible.session=${sid} --label crucible.worktree='${directory.replace(/'/g, `'\\''`)}'`
+            output.args.command = c.replace(/\b((?:docker|podman)(?:\s+container)?\s+run)\b/g, `$1 ${labels.replace(/\$/g, "$$$$")}`)
+          }
           if (effectiveShellPolicy(caller.state) === "allow") return // per-run: guard disabled
           const cmd = String(output?.args?.command ?? output?.args?.cmd ?? "")
-          if (isDestructive(cmd)) throw new Error("Crucible guard: destructive shell command blocked.")
+          if (isDestructive(cmd)) throw new Error("Crucible guard: destructive or repository-changing command blocked (read-only git such as status, log, diff and show is allowed).")
           return
         }
         for (const file of files) {
@@ -2633,46 +2916,6 @@ export const server = async (input: any, options?: any) => {
         }
       } catch (e: any) {
         if (String(e?.message || "").includes("Crucible guard")) throw e
-      }
-    },
-
-    async "permission.ask"(input: any, output: any) {
-      try {
-        const sid = input?.sessionID
-        if (!sid) return
-        // Only guard sessions the plugin dispatched.
-        const caller = await callerRun(directory, sid)
-        if (!caller) return
-        const policy = effectiveShellPolicy(caller.state)
-        if (policy === "allow") {
-          if (output.status === "ask") output.status = "allow"
-          return
-        }
-        const type = String(input?.type || "").toLowerCase()
-        const patterns = [input?.pattern].flat().filter(Boolean).map(String)
-
-        const looksShell = type === "bash" || type === "shell" || type.includes("bash") || !!input?.metadata?.command
-        if (looksShell) {
-          const cmd = patterns.join(" ") || String(input?.metadata?.command || input?.title || "")
-          if (isDestructive(cmd)) {
-            output.status = "deny"
-            return
-          }
-          // "ask" leaves the prompt to the user; "guarded" runs it unprompted.
-          if (policy === "guarded" && output.status === "ask") output.status = "allow"
-          return
-        }
-        if (policy === "ask") return
-
-        // Crucible agents work inside the project and the evidence sandbox.
-        if (type === "external_directory" || type.includes("directory")) {
-          const allowed =
-            patterns.length > 0 &&
-            patterns.every((p) => withinDir(p, directory) || withinDir(p, "/tmp/opencode"))
-          output.status = allowed ? "allow" : "deny"
-        }
-      } catch {
-        // fail closed: leave the requested status untouched
       }
     },
 
@@ -2697,6 +2940,7 @@ export const server = async (input: any, options?: any) => {
 
     async dispose() {
       disposed = true
+      killMarked(`CRUCIBLE_WORKTREE=${directory}`)
       // A re-created instance for this worktree recovers its runs again.
       recoveredDirs.delete(directory)
       // Only this instance's watchdogs: other instances in the process keep theirs.

@@ -12,6 +12,7 @@ import {
   isBindingEvidence,
   isSupportedEvidence,
   isDestructive,
+  changesGit,
   renderRequirements,
   summarize,
   childrenGate,
@@ -24,6 +25,7 @@ import {
   manifestProblems,
   categoryInScope,
   isAcceptedTerminal,
+  reopenStatus,
   subsystemBlocks,
   subsystemMatches,
   decidePhase,
@@ -42,6 +44,15 @@ import {
   refreshCoverage,
   openGate,
   boardClean,
+  unbackedReason,
+  nextFindingId,
+  mergeRisks,
+  looseEnds,
+  rescore,
+  recentlyExamined,
+  unverifiedFixes,
+  gateAcceptance,
+  settleVerification,
 } from "../src/core"
 
 const fullCoverage = { dimensions: [...REQUIRED_DIMENSIONS], examined: [...REQUIRED_DIMENSIONS], gaps: [] }
@@ -77,6 +88,14 @@ function verdict(over: any = {}) {
 function runRound(state: any, v: any, response: any = { responses: [] }) {
   state.verdicts[state.round] = v
   return recordRound(state, response, state.design_revision)
+}
+
+// Simulates the verification round: a clean verdict, then settles it.
+function verifyClean(s: any) {
+  s.round++
+  s.verdicts[s.round] = verdict({ round: s.round, findings: [] })
+  applyValidation(s, s.round, s.verdicts[s.round], null)
+  return settleVerification(s)
 }
 
 function readyState(mode = "fast", maxRounds?: number) {
@@ -149,7 +168,7 @@ describe("validation ladder", () => {
     expect(byId["F-004"]).toBe("needs_adjudication")
   })
 
-  test("fix resolves, strong rebut resolves, weak rebut needs adjudication, accept_risk records", () => {
+  test("fix resolves, backed rebut resolves, weak rebut needs adjudication, accept_risk is contested when binding and recorded otherwise", () => {
     const s = readyState()
     s.round = 1
     const v = verdict({
@@ -158,21 +177,25 @@ describe("validation ladder", () => {
         finding({ id: "F-002" }),
         finding({ id: "F-003" }),
         finding({ id: "F-004" }),
+        finding({ id: "F-005", evidence: { class: "structured_argument", verification: "supported" } }),
       ],
     })
+    s.evidence.push({ id: "E-001", class: "executable" })
     applyValidation(s, 1, v, {
       responses: [
         { finding_id: "F-001", disposition: "fix" },
-        { finding_id: "F-002", disposition: "rebut", refutation_evidence: { class: "executable", verification: "verified", detail: "x" } },
+        { finding_id: "F-002", disposition: "rebut", refutation_evidence: { class: "executable", verification: "verified", artifact_id: "E-001", detail: "x" } },
         { finding_id: "F-003", disposition: "rebut", refutation_evidence: { class: "belief", detail: "y" } },
         { finding_id: "F-004", disposition: "accept_risk" },
+        { finding_id: "F-005", disposition: "accept_risk" },
       ],
     })
-    const byId: any = Object.fromEntries(s.open_findings.map((f: any) => [f.id, f.status]))
-    expect(byId["F-001"]).toBe("resolved")
-    expect(byId["F-002"]).toBe("resolved")
-    expect(byId["F-003"]).toBe("needs_adjudication")
-    expect(byId["F-004"]).toBe("accepted_risk")
+    const byId: any = Object.fromEntries(s.open_findings.map((f: any) => [f.id, f]))
+    expect(byId["F-001"].status).toBe("resolved")
+    expect(byId["F-002"].status).toBe("resolved")
+    expect(byId["F-003"].status).toBe("needs_adjudication")
+    expect(byId["F-004"]).toMatchObject({ status: "needs_adjudication", contested: true })
+    expect(byId["F-005"]).toMatchObject({ status: "accepted_risk", contested: false })
   })
 
   test("countNewGate only counts verified, cited, artifact-backed gate findings", () => {
@@ -246,7 +269,9 @@ describe("convergence", () => {
     runRound(s, verdict({ round: 2, findings: [finding({ id: "F-002" })], verdict: "changes_required" }), {
       responses: [{ finding_id: "F-002", disposition: "fix" }],
     })
-    expect(s.phase).toBe("accepted_with_reservations")
+    expect(s.phase).toBe("designing")
+    expect(s.verify.target).toBe("accepted_with_reservations")
+    expect(verifyClean(s)).toBe("accepted_with_reservations")
     expect(s.gate_stall_streak).toBe(0)
   })
 
@@ -262,7 +287,9 @@ describe("convergence", () => {
       })
     }
     // Two majors per round is normal exploration; at the round budget the board is clean.
-    expect(s.phase).toBe("accepted_with_reservations")
+    expect(s.phase).toBe("designing")
+    expect(s.verify.target).toBe("accepted_with_reservations")
+    expect(verifyClean(s)).toBe("accepted_with_reservations")
   })
 
   test("a burst inside the last k rounds is not a plateau", () => {
@@ -284,7 +311,9 @@ describe("convergence", () => {
       responses: [{ finding_id: "F-3a", disposition: "fix" }],
     })
     // now the last k gates are [1, 1]: accepted with reservations
-    expect(s.phase).toBe("accepted_with_reservations")
+    expect(s.phase).toBe("designing")
+    expect(s.verify.target).toBe("accepted_with_reservations")
+    expect(verifyClean(s)).toBe("accepted_with_reservations")
   })
 
   test("unresolved findings still budget_stop, not accepted", () => {
@@ -402,19 +431,27 @@ describe("path containment", () => {
   })
 })
 
-describe("regression quarantine", () => {
-  test("a re-raised resolved finding without fresh evidence is quarantined", () => {
+describe("regression id reuse", () => {
+  test("a re-raised resolved id is rejected unless it cites evidence recorded this round", () => {
     const s = readyState()
-    s.history.push({ resolved_ids: ["F-001"] })
+    s.history.push({ round: 1, resolved_ids: ["F-001"] })
+    s.verdicts[1] = verdict({ findings: [finding({ id: "F-001" })] })
     s.round = 2
+    s.design_revision = "v1"
     const v = verdict({ round: 2, findings: [finding({ id: "F-001" })] })
-    applyValidation(s, 2, v, { responses: [] })
-    expect(s.open_findings[0].status).toBe("needs_adjudication")
-    expect(countNewGate(v, s)).toBe(0)
-    // Fresh (this-round) evidence re-validates it.
-    s.evidence.push({ id: "E-9", round: 2 })
+    const problems = verdictProblems(s, v)
+    expect(problems.length).toBe(1)
+    expect(problems[0]).toContain("reuses the id")
+    expect(problems[0]).toContain("F-002")
+    // Stale evidence (recorded in an earlier round) does not count.
+    s.evidence.push({ id: "E-8", round: 1 })
+    const stale = verdict({ round: 2, findings: [finding({ id: "F-001", evidence: { class: "executable", verification: "verified", artifact_id: "E-8" } })] })
+    expect(verdictProblems(s, stale).length).toBe(1)
+    // Fresh (this-round) evidence re-raises it.
+    s.evidence.push({ id: "E-9", round: 2, class: "executable" })
     const v2 = verdict({ round: 2, findings: [finding({ id: "F-001", evidence: { class: "executable", verification: "verified", artifact_id: "E-9" } })] })
-    expect(countNewGate(v2, s)).toBe(1)
+    expect(verdictProblems(s, v2)).toEqual([])
+    expect(countNewGate(v2)).toBe(1)
   })
 })
 
@@ -431,9 +468,9 @@ describe("diminishing returns", () => {
 })
 
 describe("countNewGate exclusions", () => {
-  test("quarantined (needs_adjudication) findings do not count", () => {
+  test("a verified requested (needs_adjudication) finding counts", () => {
     const v = verdict({ findings: [finding({ id: "F-001", action: "needs_adjudication" }), finding({ id: "F-002" })] })
-    expect(countNewGate(v)).toBe(1)
+    expect(countNewGate(v)).toBe(2)
   })
   test("disputed verification does not count as validated", () => {
     const v = verdict({ findings: [finding({ id: "F-001", evidence: { class: "executable", verification: "disputed" } })] })
@@ -442,18 +479,20 @@ describe("countNewGate exclusions", () => {
 })
 
 describe("architect dispositions", () => {
-  test("simplify resolves, wont_fix records as accepted risk", () => {
+  test("simplify resolves, wont_fix is contested on a binding major and accepted on a non-binding one", () => {
     const s = readyState()
     s.round = 1
-    applyValidation(s, 1, verdict({ findings: [finding({ id: "F-001" }), finding({ id: "F-002" })] }), {
+    applyValidation(s, 1, verdict({ findings: [finding({ id: "F-001" }), finding({ id: "F-002" }), finding({ id: "F-003", evidence: { class: "structured_argument", verification: "supported" } })] }), {
       responses: [
         { finding_id: "F-001", disposition: "simplify" },
         { finding_id: "F-002", disposition: "wont_fix" },
+        { finding_id: "F-003", disposition: "wont_fix" },
       ],
     })
-    const byId: any = Object.fromEntries(s.open_findings.map((f: any) => [f.id, f.status]))
-    expect(byId["F-001"]).toBe("resolved")
-    expect(byId["F-002"]).toBe("accepted_risk")
+    const byId: any = Object.fromEntries(s.open_findings.map((f: any) => [f.id, f]))
+    expect(byId["F-001"].status).toBe("resolved")
+    expect(byId["F-002"]).toMatchObject({ status: "needs_adjudication", contested: true })
+    expect(byId["F-003"].status).toBe("accepted_risk")
   })
 })
 
@@ -624,18 +663,31 @@ describe("scale model: subsystem rejection", () => {
 
 describe("scale model: domain-scoped gating", () => {
   test("out-of-domain categories are advisory, in-domain still bind", () => {
+    const weak = { class: "structured_argument", verification: "supported" }
     const s = readyState()
     s.domains = ["security"]
     expect(categoryInScope(s, "security")).toBe(true)
     expect(categoryInScope(s, "scale")).toBe(false)
     expect(categoryInScope(s, "contradiction")).toBe(true) // cross-cutting stays in scope
     s.round = 1
-    applyValidation(s, 1, verdict({ findings: [finding({ id: "F-001", category: "scale" }), finding({ id: "F-002", category: "security" })] }), {
+    applyValidation(s, 1, verdict({ findings: [finding({ id: "F-001", category: "scale", evidence: weak }), finding({ id: "F-002", category: "security" }), finding({ id: "F-003", category: "scale" })] }), {
       responses: [],
     })
     const byId: any = Object.fromEntries(s.open_findings.map((f: any) => [f.id, f.status]))
     expect(byId["F-001"]).toBe("advisory")
     expect(byId["F-002"]).toBe("binding")
+    expect(byId["F-003"]).toBe("binding") // verified out-of-domain major still gates
+    expect(countNewGate(verdict({ findings: [finding({ id: "F-9", category: "scale" })] }))).toBe(1)
+  })
+})
+
+describe("scale model: verified out-of-domain majors", () => {
+  test("classify as binding and count toward the new gate", () => {
+    const s = readyState()
+    s.domains = ["security"]
+    const f = finding({ id: "F-1", category: "scale" })
+    expect(classifyFinding(s, f, undefined as any).status).toBe("binding")
+    expect(countNewGate(verdict({ findings: [f] }))).toBe(1)
   })
 })
 
@@ -659,13 +711,21 @@ describe("scale model: subsystemBlocks requires gate-worthy evidence", () => {
     expect(subsystemBlocks(real)).toEqual([{ name: "payments", finding_id: "F-2" }])
   })
   test("quarantined, out-of-scope, and adjudicated findings do not block", () => {
-    const quarantined = classified([{ ...finding({ id: "F-1", action: "needs_adjudication" }), subsystem_ref: "payments" }])
+    const weakAsk = { class: "structured_argument", verification: "supported" }
+    const quarantined = classified([{ ...finding({ id: "F-1", action: "needs_adjudication", evidence: weakAsk }), subsystem_ref: "payments" }])
     expect(subsystemBlocks(quarantined)).toEqual([])
+    const asked = classified([{ ...finding({ id: "F-1", action: "needs_adjudication" }), subsystem_ref: "payments" }])
+    expect(subsystemBlocks(asked)).toEqual([{ name: "payments", finding_id: "F-1" }])
     const s = readyState()
     s.domains = ["security"]
     s.round = 1
-    applyValidation(s, 1, verdict({ findings: [{ ...finding({ id: "F-2", category: "scale" }), subsystem_ref: "payments" }] }), null)
+    applyValidation(s, 1, verdict({ findings: [{ ...finding({ id: "F-2", category: "scale", evidence: weakAsk }), subsystem_ref: "payments" }] }), null)
     expect(subsystemBlocks(s)).toEqual([])
+    const v = readyState()
+    v.domains = ["security"]
+    v.round = 1
+    applyValidation(v, 1, verdict({ findings: [{ ...finding({ id: "F-4", category: "scale" }), subsystem_ref: "payments" }] }), null)
+    expect(subsystemBlocks(v)).toEqual([{ name: "payments", finding_id: "F-4" }])
     const adj = readyState()
     adj.round = 1
     adj.adjudications = { "F-3": { decision: "resolved", round: 1 } }
@@ -744,7 +804,9 @@ describe("per-run configuration", () => {
     runRound(s, verdict({ findings: [finding({ id: "F-1" })] }), { responses: [{ finding_id: "F-1", disposition: "fix" }] })
     s.round = 2
     runRound(s, verdict({ findings: [finding({ id: "F-2" })] }), { responses: [{ finding_id: "F-2", disposition: "fix" }] })
-    expect(s.phase).toBe("accepted_with_reservations")
+    expect(s.phase).toBe("designing")
+    expect(s.verify.target).toBe("accepted_with_reservations")
+    expect(verifyClean(s)).toBe("accepted_with_reservations")
   })
 })
 
@@ -897,7 +959,7 @@ describe("destructive guard", () => {
     expect(isDestructive("rm -rf build/")).toBe(false)
     expect(isDestructive("rm -rf cyfr/cpp/build")).toBe(false)
     expect(isDestructive("git status")).toBe(false)
-    expect(isDestructive("git clean --dry-run")).toBe(false)
+    expect(isDestructive("git clean --dry-run")).toBe(true)
   })
 })
 
@@ -939,8 +1001,9 @@ describe("round-scoped adjudications", () => {
     // Findings renumber: round 2's F-001 is a different finding.
     runRound(s, verdict({ round: 2, findings: [finding({ id: "F-001", claim: "different" })] }))
     const f = s.open_findings.find((x: any) => x.id === "F-001")
-    // Resolved in round 1, re-raised without fresh evidence: quarantined.
-    expect(f.status).toBe("needs_adjudication")
+    // Resolved in round 1 and reused (runRound skips verdictProblems): a binding regression.
+    expect(f.status).toBe("binding")
+    expect(f.regression).toBe(true)
     expect(s.adjudications["F-001"]).toBeUndefined() // pruned once its round passed
   })
 })
@@ -967,9 +1030,9 @@ describe("weak rebuttal of a binding finding (contested)", () => {
     expect(["no_progress", "budget_stopped"]).toContain(s.phase)
     expect(s.phase).not.toBe("accepted_with_reservations")
   })
-  test("a weak rebut of a non-binding finding is quarantined, not contested", () => {
+  test("a weak rebut of a non-binding finding needs adjudication but is not contested", () => {
     const s = readyState()
-    const cls = classifyFinding(s, 1, finding({ evidence: { class: "structured_argument", verification: "supported" } }), weak)
+    const cls = classifyFinding(s, finding({ evidence: { class: "structured_argument", verification: "supported" } }), weak)
     expect(cls).toEqual({ status: "needs_adjudication", contested: false })
   })
   test("a user adjudication for the round clears the contest", () => {
@@ -1118,7 +1181,10 @@ describe("destructive guard (extended)", () => {
     }
   })
   test("allows ordinary git and scoped removals", () => {
-    for (const cmd of ["git checkout -b feature", "git checkout main", "git restore --staged x", "git stash", "rm -rf ../x", "rm -rf ./build"]) {
+    for (const cmd of ["git checkout -b feature", "git checkout main", "git restore --staged x", "git stash"]) {
+      expect(isDestructive(cmd)).toBe(true)
+    }
+    for (const cmd of ["rm -rf ../x", "rm -rf ./build"]) {
       expect(isDestructive(cmd)).toBe(false)
     }
   })
@@ -1318,5 +1384,406 @@ describe("handoff carries plugin context", () => {
     expect(h.design_dir).toBe("sub/docs/design/bank--pay")
     expect(h.config.shellPolicy).toBe("ask")
     expect(h.parent_block_findings[0].claim).toBe("wrong contract")
+  })
+})
+
+describe("unbackedReason", () => {
+  test("null for authoritative or no class; a message for unrecorded executable/model_checked", () => {
+    const s = newState("probe", "Probe", "sess-1")
+    expect(unbackedReason(s, { class: "authoritative" })).toBeNull()
+    expect(unbackedReason(s, {})).toBeNull()
+    expect(unbackedReason(s, undefined)).toBeNull()
+    expect(unbackedReason(s, { class: "executable" })).toContain("no recorded evidence artifact")
+    expect(unbackedReason(s, { class: "model_checked", artifact_id: "E-404" })).toContain("E-404")
+    s.evidence.push({ id: "E-001", class: "executable" }, { id: "E-002", class: "belief" })
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" })).toBeNull()
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-002" })).toContain("belief")
+  })
+})
+
+describe("rebut evidence backing", () => {
+  const rebut = (artifact_id?: string) => ({
+    round: 1,
+    responses: [{ finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "executable", verification: "verified", artifact_id } }],
+  })
+  test("verified executable refutation needs a recorded artifact", () => {
+    const s = readyState()
+    s.round = 1
+    s.open_findings = [{ id: "F-001" }]
+    expect(responseProblems(s, rebut(), false).some((p) => p.includes("design_record_evidence"))).toBe(true)
+    s.evidence.push({ id: "E-001", class: "executable" })
+    expect(responseProblems(s, rebut("E-001"), false)).toEqual([])
+  })
+})
+
+describe("nextFindingId", () => {
+  test("max F-### over verdicts and open findings, plus one, padded; ignores other ids", () => {
+    const s = newState("probe", "Probe", "sess-1")
+    expect(nextFindingId(s)).toBe("F-001")
+    s.verdicts[1] = verdict({ findings: [finding({ id: "F-003" }), finding({ id: "X-9" }), finding({ id: "F-1a" })] })
+    expect(nextFindingId(s)).toBe("F-004")
+    s.open_findings = [{ id: "F-006" }]
+    expect(nextFindingId(s)).toBe("F-007")
+  })
+})
+
+describe("held findings carried across rounds", () => {
+  const weak = { finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief" } }
+  function heldRun() {
+    const s = readyState("standard", 10)
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [finding({ id: "F-001" })] }), { responses: [weak] })
+    return s
+  }
+  test("round 1 holds and escalates a weakly rebutted binding major", () => {
+    const s = heldRun()
+    expect(s.open_findings[0]).toMatchObject({ status: "needs_adjudication", contested: true, held: true })
+    expect(s.escalations.find((e: any) => e.requirement_id === "F-001")).toMatchObject({ kind: "finding", round: 1 })
+  })
+  test("round 2 still carries it: contested, gating, escalation kept", () => {
+    const s = heldRun()
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }))
+    const f = s.open_findings.find((x: any) => x.id === "F-001")
+    expect(f).toMatchObject({ round: 1, status: "needs_adjudication", contested: true, held: true })
+    expect(openGate(s)).toBe(1)
+    expect(s.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
+  })
+  test("a user ruling resolves it, is listed in resolved_ids, then it is dropped", () => {
+    const s = heldRun()
+    s.adjudications["F-001"] = { decision: "resolved", round: 1 }
+    s.open_findings[0].status = "resolved"
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }))
+    expect(s.history[1].resolved_ids).toContain("F-001")
+    expect(s.open_findings.find((x: any) => x.id === "F-001").held).toBe(false)
+    expect(openGate(s)).toBe(0)
+    s.round = 3
+    runRound(s, verdict({ round: 3, findings: [] }))
+    expect(s.open_findings.some((x: any) => x.id === "F-001")).toBe(false)
+  })
+  test("an Architect fix in round 2 resolves the carried finding", () => {
+    const s = heldRun()
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }), { responses: [{ finding_id: "F-001", disposition: "fix" }] })
+    expect(s.open_findings.find((x: any) => x.id === "F-001")).toMatchObject({ status: "resolved", held: false })
+    expect(s.history[1].resolved_ids).toContain("F-001")
+  })
+})
+
+describe("falsifier-requested adjudication", () => {
+  const ask = (over: any = {}) => finding({ id: "F-001", action: "needs_adjudication", ...over })
+  const weak = { class: "structured_argument", verification: "supported" }
+  const bound = (s: any) => {
+    s.round = 1
+    s.adjudications["F-001"] = { decision: "binding", round: 1 }
+  }
+  test("a verified requested major is contested, gates, is escalated and held", () => {
+    const s = readyState("standard")
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [ask()] }))
+    expect(s.open_findings[0]).toMatchObject({ status: "needs_adjudication", contested: true, held: true })
+    expect(s.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
+    expect(openGate(s)).toBe(1)
+  })
+  test("a weakly evidenced requested major is escalated and held but does not gate", () => {
+    const s = readyState("standard")
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [ask({ evidence: weak })] }))
+    expect(s.open_findings[0]).toMatchObject({ status: "needs_adjudication", contested: false, held: true })
+    expect(s.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
+    expect(openGate(s)).toBe(0)
+  })
+  test("an Architect fix is only a proposal: still needs_adjudication, contested", () => {
+    const s = readyState("standard")
+    s.round = 1
+    applyValidation(s, 1, verdict({ findings: [ask()] }), { responses: [{ finding_id: "F-001", disposition: "fix" }] })
+    expect(s.open_findings[0]).toMatchObject({ status: "needs_adjudication", contested: true })
+  })
+  test("reopenStatus: requested -> binding ratified; contested binding and noise are not ratified", () => {
+    const s = readyState("standard")
+    s.round = 1
+    applyValidation(s, 1, verdict({ findings: [ask(), finding({ id: "F-002" }), finding({ id: "F-003", artifact_ref: "" })] }), {
+      responses: [{ finding_id: "F-002", disposition: "rebut", refutation_evidence: { class: "belief" } }],
+    })
+    const by = (id: string) => s.open_findings.find((f: any) => f.id === id)
+    expect(reopenStatus(s, by("F-001"))).toMatchObject({ status: "binding", ratified: true })
+    expect(reopenStatus(s, by("F-002"))).toMatchObject({ status: "binding", ratified: false })
+    expect(by("F-003").status).toBe("rejected_noise")
+    expect(reopenStatus(s, by("F-003"))).toMatchObject({ status: "rejected_noise", ratified: false })
+  })
+  test("after a binding reopen (same round): fix resolves, no answer binds, weak rebut is contested", () => {
+    const run = (response: any) => {
+      const s = readyState("standard")
+      bound(s)
+      applyValidation(s, 1, verdict({ findings: [ask()] }), response)
+      return s.open_findings.find((f: any) => f.id === "F-001")
+    }
+    expect(run({ responses: [{ finding_id: "F-001", disposition: "fix" }] }).status).toBe("resolved")
+    expect(run(null)).toMatchObject({ status: "binding" })
+    expect(run({ responses: [{ finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief" } }] })).toMatchObject({
+      status: "needs_adjudication",
+      contested: true,
+    })
+  })
+  test("carried: a held requested finding reopened by the user is resolved by a later Architect fix", () => {
+    const s = readyState("standard")
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [ask()] }))
+    s.adjudications["F-001"] = { decision: "binding", round: 1 }
+    s.open_findings.find((f: any) => f.id === "F-001").status = "binding"
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }), { responses: [{ finding_id: "F-001", disposition: "fix" }] })
+    expect(s.open_findings.find((f: any) => f.id === "F-001" && f.status !== "resolved")).toBeUndefined()
+  })
+  test("a user resolved adjudication wins over the Architect's rebut", () => {
+    const s = readyState("standard")
+    s.round = 1
+    s.adjudications["F-001"] = { decision: "resolved", round: 1 }
+    applyValidation(s, 1, verdict({ findings: [ask()] }), {
+      responses: [{ finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief" } }],
+    })
+    expect(s.open_findings.find((f: any) => f.id === "F-001").status).toBe("resolved")
+  })
+})
+
+describe("stall measure ignores held findings", () => {
+  test("a carried contested finding does not end in no_progress; round_gate vs gate", () => {
+    const s = readyState("standard", 10)
+    s.budgets.m = 2
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [finding({ id: "F-001" })] }), {
+      responses: [{ finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief" } }],
+    })
+    for (const round of [2, 3, 4]) {
+      s.round = round
+      const id = `F-00${round}`
+      runRound(s, verdict({ round, findings: [finding({ id, claim: `c${round}` })] }), { responses: [{ finding_id: id, disposition: "fix" }] })
+      expect(s.phase).toBe("designing")
+      expect(s.history[round - 1]).toMatchObject({ round_gate: 0, gate: 1 })
+    }
+    expect(s.history[0]).toMatchObject({ round_gate: 1, gate: 1 })
+  })
+})
+
+describe("accepted-risk ledger", () => {
+  test("a risk accepted in round 1 survives absence from round 2's verdict", () => {
+    const s = readyState("standard")
+    const supported = { class: "structured_argument", verification: "supported" }
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [finding({ id: "F-001", evidence: supported, claim: "slow path" })] }), {
+      responses: [{ finding_id: "F-001", disposition: "accept_risk" }],
+    })
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }))
+    expect(s.open_findings.length).toBe(0)
+    expect(renderOpenIssues(s)).toContain("| F-001 | major | data | accept_risk | slow path |")
+  })
+  test("a user-adjudicated acceptance is listed as accepted by user", () => {
+    const s = readyState("standard")
+    s.round = 1
+    s.adjudications["F-001"] = { decision: "accepted_risk", round: 1 }
+    runRound(s, verdict({ round: 1, findings: [finding({ id: "F-001" })] }), { responses: [{ finding_id: "F-001", disposition: "fix" }] })
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [] }))
+    expect(renderOpenIssues(s)).toContain("| F-001 | major | data | user |")
+  })
+  test("mergeRisks removes a reopened id@round and labels acceptors", () => {
+    const acc = (over: any) => ({ id: "F-001", round: 1, severity: "major", category: "data", claim: "c", status: "accepted_risk", ...over })
+    let ledger = mergeRisks([], [acc({ disposition: "accept_risk" }), acc({ id: "F-002", decided_by: "user", disposition: "fix" })])
+    expect(ledger.map((r) => [r.id, r.accepted_by])).toEqual([["F-001", "accept_risk"], ["F-002", "user"]])
+    ledger = mergeRisks(ledger, [acc({ status: "binding" }), acc({ id: "F-002", round: 2 })])
+    expect(ledger.map((r) => `${r.id}@${r.round}`)).toEqual(["F-002@1", "F-002@2"])
+  })
+})
+
+describe("rescore", () => {
+  function stopped() {
+    const s = readyState("standard", 1)
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [finding({ id: "F-001" })] }), {
+      responses: [{ finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief" } }],
+    })
+    return s
+  }
+  test("budget_stopped only by a contested finding becomes accepted_with_reservations once resolved", () => {
+    const s = stopped()
+    expect(s.phase).toBe("budget_stopped")
+    s.open_findings[0].status = "resolved"
+    s.open_findings[0].contested = false
+    expect(rescore(s)).toBe(true)
+    expect(s.phase).toBe("accepted_with_reservations")
+  })
+  test("false when dispatch is set, history is stale, or the phase is stopped", () => {
+    const resolve = (s: any) => ((s.open_findings[0].status = "resolved"), (s.open_findings[0].contested = false), s)
+    const a = resolve(stopped())
+    a.dispatch = { role: "falsifier" }
+    expect(rescore(a)).toBe(false)
+    const b = resolve(stopped())
+    b.round = 2
+    expect(rescore(b)).toBe(false)
+    const c = resolve(stopped())
+    c.phase = "stopped"
+    expect(rescore(c)).toBe(false)
+    expect(c.phase).toBe("stopped")
+  })
+})
+
+describe("verification pass", () => {
+  const fixed = (over: any = {}) => ({
+    ...finding(),
+    status: "resolved",
+    decided_by: "architect",
+    disposition: "fix",
+    evidence_class: "executable",
+    verification: "verified",
+    ...over,
+  })
+  test("unverifiedFixes includes architect-fixed binding majors only", () => {
+    const s = readyState()
+    s.open_findings = [
+      fixed({ id: "F-1" }),
+      fixed({ id: "F-2", decided_by: "user" }),
+      fixed({ id: "F-3", severity: "minor" }),
+      fixed({ id: "F-4", verification: "supported" }),
+      fixed({ id: "F-5", disposition: "rebut" }),
+    ]
+    expect(unverifiedFixes(s).map((f: any) => f.id)).toEqual(["F-1"])
+  })
+  test("gateAcceptance passes other phases and clears verify; gates accepted ones", () => {
+    const s = readyState()
+    s.open_findings = [fixed({ id: "F-1" })]
+    s.verify = { target: "x", ids: [], round: 0 }
+    expect(gateAcceptance(s, "responding")).toBe("responding")
+    expect(s.verify).toBeNull()
+    s.round = 2
+    expect(gateAcceptance(s, "converged")).toBe("designing")
+    expect(s.verify).toEqual({ target: "converged", ids: ["F-1"], round: 2 })
+    s.open_findings = []
+    expect(gateAcceptance(s, "converged")).toBe("converged")
+    expect(s.verify).toBeNull()
+  })
+  function awaiting() {
+    const s = readyState("fast", 2)
+    s.round = 1
+    runRound(s, verdict({ findings: [finding({ id: "F-1" })] }), { responses: [{ finding_id: "F-1", disposition: "fix" }] })
+    s.round = 2
+    runRound(s, verdict({ findings: [finding({ id: "F-2" })] }), { responses: [{ finding_id: "F-2", disposition: "fix" }] })
+    return s
+  }
+  test("settleVerification: clean board gives the target", () => {
+    const s = awaiting()
+    expect(verifyClean(s)).toBe("accepted_with_reservations")
+    expect(s.verify).toBeNull()
+  })
+  test("settleVerification: re-raised major stops after budget, continues within it", () => {
+    const over = awaiting()
+    expect(over.round).toBe(2)
+    over.round = 3
+    over.verdicts[3] = verdict({ round: 3, findings: [finding({ id: "F-9" })] })
+    applyValidation(over, 3, over.verdicts[3], null)
+    expect(settleVerification(over)).toBe("budget_stopped")
+    const within = readyState("fast", 5)
+    within.round = 1
+    runRound(within, verdict({ findings: [finding({ id: "F-1" })] }), { responses: [{ finding_id: "F-1", disposition: "fix" }] })
+    within.verify = { target: "accepted_with_reservations", ids: ["F-1"], round: 1 }
+    within.round = 2
+    within.verdicts[2] = verdict({ round: 2, findings: [finding({ id: "F-9" })] })
+    applyValidation(within, 2, within.verdicts[2], null)
+    expect(settleVerification(within)).toBe("responding")
+  })
+  test("rescore with unverified fixes sets designing + verify", () => {
+    const s = awaiting()
+    s.phase = "budget_stopped"
+    s.verify = null
+    expect(rescore(s)).toBe(true)
+    expect(s.phase).toBe("designing")
+    expect(s.verify.target).toBe("accepted_with_reservations")
+  })
+})
+
+describe("recentlyExamined", () => {
+  test("unions coverage.examined over (max(base, round - k), round]", () => {
+    const s = newState("probe", "Probe", "sess-1")
+    s.budgets.k = 2
+    s.round = 3
+    s.verdicts[1] = verdict({ coverage: { examined: ["security"] } })
+    s.verdicts[2] = verdict({ coverage: { examined: ["cost"] } })
+    s.verdicts[3] = verdict({ coverage: { examined: ["scale", "cost"] } })
+    expect(recentlyExamined(s).sort()).toEqual(["cost", "scale"])
+    s.integration_base_round = 2
+    expect(recentlyExamined(s)).toEqual(["scale", "cost"])
+  })
+})
+
+describe("looseEnds", () => {
+  test("lists unresolved findings and accepted risks, skips resolved/noise", () => {
+    const mk = (id: string, status: string) => ({ id, severity: "minor", category: "c", status, claim: "x".repeat(300) })
+    const child = {
+      slug: "r--a",
+      namespace: "A",
+      open_findings: [mk("F-1", "advisory"), mk("F-2", "resolved"), mk("F-3", "rejected_noise"), mk("F-4", "accepted_risk")],
+      risks: [{ id: "F-9", severity: "major", category: "c", claim: "old" }],
+    }
+    const ends = looseEnds(child)
+    expect(ends.map((e: any) => [e.id, e.status])).toEqual([["F-1", "advisory"], ["F-9", "accepted_risk"], ["F-4", "accepted_risk"]])
+    expect(ends[0]).toMatchObject({ subsystem: "A", claim: "x".repeat(200) })
+    expect(handoff(newState("r", "R", "s"), "falsifier", { looseEnds: ends }).subsystem_loose_ends).toEqual(ends)
+  })
+})
+
+describe("read-only git for dispatched agents", () => {
+  test("allows read-only subcommands, with global options", () => {
+    for (const c of ["git status", "git log --oneline -5", "git -C /x diff HEAD~1", "git --no-pager show HEAD", "git -c core.pager=cat log"]) expect(changesGit(c)).toBe(false)
+  })
+  test("blocks anything else, anywhere in the line", () => {
+    for (const c of ["git commit -m x", "git add .", "git -C /repo commit -am x", "cd x && git status && git commit -m y", "sh -c 'git push'", "/usr/bin/git reset --soft HEAD~1", "echo hi | git hash-object -w --stdin"]) expect(changesGit(c)).toBe(true)
+  })
+  test("does not flag non-git words", () => {
+    expect(changesGit("digit 5")).toBe(false)
+    expect(changesGit("legit thing")).toBe(false)
+  })
+})
+
+describe("delegation to subsystems", () => {
+  const root = () => {
+    const s = readyState()
+    s.decompose = true
+    s.subsystems = [{ name: "payments", namespace: "PAY", slug: "r--payments" }]
+    return s
+  }
+  test("fix on a subsystem-tagged root finding stays binding", () => {
+    for (const ref of ["payments", "PAY"]) {
+      const r = classifyFinding(root(), finding({ subsystem_ref: ref, artifact_ref: "03-architecture.md#x" }), { disposition: "fix" })
+      expect(r.status).toBe("binding")
+    }
+  })
+  test("fix without subsystem_ref resolves", () => {
+    expect(classifyFinding(root(), finding({ artifact_ref: "03-architecture.md#x" }), { disposition: "fix" }).status).toBe("resolved")
+  })
+  test("non-root state resolves even with subsystem_ref", () => {
+    const r = classifyFinding(readyState(), finding({ subsystem_ref: "payments", artifact_ref: "03-architecture.md#x" }), { disposition: "fix" })
+    expect(r.status).toBe("resolved")
+  })
+})
+
+describe("minor-only acceptance", () => {
+  const minor = (id: string) =>
+    finding({ id, severity: "minor", evidence: { class: "structured_argument", verification: "supported" } })
+  test("two minor-only rounds -> accepted_with_reservations", () => {
+    const s = readyState("standard")
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [minor("F-1")] }))
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [minor("F-2")] }))
+    expect(s.phase).toBe("accepted_with_reservations")
+  })
+  test("a plausible major in one round keeps designing", () => {
+    const s = readyState("standard")
+    s.round = 1
+    runRound(s, verdict({ round: 1, findings: [minor("F-1"), finding({ id: "F-2", severity: "major", evidence: { class: "belief", verification: "unverified" } })] }))
+    s.round = 2
+    runRound(s, verdict({ round: 2, findings: [minor("F-3")] }))
+    expect(s.phase).toBe("designing")
   })
 })

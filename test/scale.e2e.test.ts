@@ -24,8 +24,12 @@ function makeClient(opts: { promptError?: (args: any) => any; status?: () => any
   let n = 0
   const prompts: any[] = []
   const aborts: any[] = []
+  const creates: any[] = []
+  const updates: any[] = []
+  const rejects: any[] = []
   const session: any = {
-    async create() {
+    async create(args: any) {
+      creates.push(args)
       return { data: { id: `ses_${++n}` } }
     },
     async promptAsync(args: any) {
@@ -33,7 +37,8 @@ function makeClient(opts: { promptError?: (args: any) => any; status?: () => any
       const error = opts.promptError?.(args)
       return error ? { error } : { data: undefined }
     },
-    async update() {
+    async update(args: any) {
+      updates.push(args)
       return { data: undefined }
     },
     async abort(args: any) {
@@ -48,6 +53,13 @@ function makeClient(opts: { promptError?: (args: any) => any; status?: () => any
   return {
     prompts,
     aborts,
+    creates,
+    updates,
+    rejects,
+    async postSessionIdPermissionsPermissionId(args: any) {
+      rejects.push(args)
+      return { data: true }
+    },
     session,
     tui: {
       async showToast() {
@@ -176,6 +188,12 @@ test("2-subsystem decompose: hold, create, pump, release, block", async () => {
     await call("design_submit_verdict", { slug: "bank", verdict_json: JSON.stringify(blockVerdict) })
     expect((await readState(dir, "bank--payments")).acceptance_blocked_by_parent).toBe("F-1")
     await call("design_respond", { slug: "bank", response_json: JSON.stringify({ round: 2, design_revision: "v3", responses: [{ finding_id: "F-1", disposition: "fix", rationale: "resolved" }] }) })
+    // root's Architect cannot edit subsystem docs: fix does not resolve a subsystem-tagged finding
+    expect((await readState(dir, "bank--payments")).acceptance_blocked_by_parent).toBe("F-1")
+    // block lifts only when a later root verdict no longer raises F-1
+    await call("design_begin_round", { slug: "bank" })
+    await call("design_submit_verdict", { slug: "bank", verdict_json: cleanVerdict(3, fullCov) })
+    await call("design_respond", { slug: "bank", response_json: JSON.stringify({ round: 3, design_revision: "v4", responses: [] }) })
     expect((await readState(dir, "bank--payments")).acceptance_blocked_by_parent).toBe(null)
 
     // --- drive payments to converged (two clean rounds) ---
@@ -1194,25 +1212,91 @@ test("recovery re-drives a turn the restart killed, and never touches another wo
   }
 })
 
-test("shell policy: plugin-level ask keeps opencode prompts; guarded auto-allows; destructive is denied", async () => {
-  for (const [options, expected] of [[{ shellPolicy: "ask" }, "ask"], [{}, "allow"]] as const) {
-    const { dir, hooks, call } = await harness(options)
+const hasRule = (rules: any[], permission: string, pattern: string, action: string) =>
+  rules.some((r) => r.permission === permission && r.pattern === pattern && r.action === action)
+
+test("shell policy: child sessions get policy rules; destructive is denied", async () => {
+  for (const [options, ext, bash] of [[{ shellPolicy: "ask" }, "ask", "ask"], [{}, "deny", "allow"]] as const) {
+    const { dir, client, hooks, call } = await harness(options)
     try {
       await readyRun(call, "sh")
       await call("design_dispatch", { slug: "sh" })
       const child = (await readState(dir, "sh")).dispatch.child_session_id
-      const ask = async (pattern: string) => {
-        const out = { status: "ask" }
-        await hooks["permission.ask"]({ sessionID: child, type: "bash", pattern }, out)
-        return out.status
-      }
-      expect(await ask("ls -la")).toBe(expected)
-      expect(await ask("rm -rf /")).toBe("deny")
-      expect(JSON.parse(await call("design_config", { slug: "sh" })).config.shellPolicy).toBe(expected === "ask" ? "ask" : "guarded")
+      const rules = client.creates.at(-1).body.permission
+      expect(hasRule(rules, "bash", "*", bash)).toBe(true)
+      expect(hasRule(rules, "external_directory", "*", ext)).toBe(true)
+      await expect(hooks["tool.execute.before"]({ tool: "bash", sessionID: child, callID: "c" }, { args: { command: "rm -rf /" } })).rejects.toThrow(/Crucible guard/)
     } finally {
       await hooks.dispose?.()
       await fs.rm(dir, { recursive: true, force: true })
     }
+  }
+})
+
+const asked = (sessionID: string) => ({ type: "permission.asked", properties: { id: "per_1", sessionID, permission: "external_directory", patterns: ["/etc/*"] } })
+
+test("permission.asked: guarded rejects for dispatched sessions only", async () => {
+  const { dir, client, hooks, call, emit } = await harness()
+  try {
+    await readyRun(call, "pa")
+    await call("design_dispatch", { slug: "pa" })
+    const child = (await readState(dir, "pa")).dispatch.child_session_id
+    await emit(asked("ses_unrelated"))
+    expect(client.rejects.length).toBe(0)
+    await emit(asked(child))
+    expect(client.rejects.length).toBe(1)
+    expect(client.rejects[0].path).toEqual({ id: child, permissionID: "per_1" })
+    expect(client.rejects[0].body).toEqual({ response: "reject" })
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("permission.asked under ask: no reject, watchdog paused until replied", async () => {
+  const { dir, client, hooks, call, emit } = await harness({ watchdogSweepMs: 20 })
+  try {
+    await readyRun(call, "pk", { shell_policy: "ask", watchdog_ms: 50 })
+    await call("design_dispatch", { slug: "pk" })
+    const child = (await readState(dir, "pk")).dispatch.child_session_id
+    await emit(asked(child))
+    expect(client.rejects.length).toBe(0)
+    await sleep(300)
+    expect(client.aborts.length).toBe(0)
+    expect(client.prompts.length).toBe(1)
+    await emit({ type: "permission.replied", properties: { sessionID: child, requestID: "per_1", reply: "once" } })
+    await sleep(300)
+    expect(client.aborts.length).toBeGreaterThanOrEqual(1)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("policy change updates a reused role session once", async () => {
+  const { dir, client, hooks, call, callAs, emit } = await harness()
+  try {
+    await readyRun(call, "pc")
+    await call("design_dispatch", { slug: "pc" })
+    const architect = (await readState(dir, "pc")).dispatch.child_session_id
+    await callAs(architect)("design_respond", { response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    await emit({ type: "session.idle", properties: { sessionID: architect } })
+    const permUpdates = () => client.updates.filter((u: any) => u.body?.permission)
+    expect(permUpdates().length).toBe(0)
+    await call("design_config", { slug: "pc", shell_policy: "allow" })
+    const falsifier = (await readState(dir, "pc")).dispatch.child_session_id
+    await callAs(falsifier)("design_submit_verdict", { slug: "pc", verdict_json: findingsVerdict(1, ["F-1"]) })
+    await emit({ type: "session.idle", properties: { sessionID: falsifier } })
+    // The falsifier session was created under "allow"; the architect is reused with the stale policy.
+    await call("design_respond", { slug: "pc", response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [] }) }).catch(() => {})
+    const st = await readState(dir, "pc")
+    expect(st.dispatch?.child_session_id ?? architect).toBeTruthy()
+    const ups = permUpdates().filter((u: any) => u.path.id === architect)
+    expect(ups.length).toBe(1)
+    expect(hasRule(ups[0].body.permission, "external_directory", "*", "allow")).toBe(true)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
   }
 })
 
@@ -1242,11 +1326,18 @@ test("dispatched agents are held to their role's tools and files", async () => {
     await expect(write(architect, "docs/design/role/.crucible/state.json")).rejects.toThrow(/\.crucible/)
     await expect(write(architect, "docs/design/other-run/03-architecture.md")).rejects.toThrow(/own run directory/)
     await write(architect, "docs/design/role/03-architecture.md")
+    await expect(write(architect, "src/app.ts")).rejects.toThrow(/own run directory/)
+    await expect(write(falsifier, "README.md")).rejects.toThrow(/own run directory/)
+    await write(architect, "/tmp/opencode/scratch.py")
     await expect(
       hooks["tool.execute.before"]({ tool: "apply_patch", sessionID: falsifier, callID: "c" }, { args: { patchText: "*** Begin Patch\n*** Update File: docs/design/role/05-risks.md\n@@\n-a\n+b\n*** End Patch" } }),
     ).rejects.toThrow(/Falsifier never edits/)
+    const bash = (sessionID: string, command: string) => hooks["tool.execute.before"]({ tool: "bash", sessionID, callID: "c" }, { args: { command } })
+    await expect(bash(falsifier, "git commit -m x")).rejects.toThrow(/repository-changing/)
+    await bash(falsifier, "git status")
     // The user's own session is never restricted.
     await hooks["tool.execute.before"]({ tool: "write", sessionID: "ses_user", callID: "c" }, { args: { filePath: "docs/design/role/.crucible/state.json" } })
+    await write("ses_user", "src/app.ts")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1568,6 +1659,337 @@ test("a new verdict withdraws the previous round's finding escalations", async (
     // Round 2's F-1 is an unrelated data finding: the round-1 gap escalation is gone.
     await call("design_submit_verdict", { slug: "esr", verdict_json: gap(2) })
     expect((await readState(dir, "esr")).escalations.some((e: any) => e.requirement_id === "F-1")).toBe(false)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("dispatched executable evidence must come from a bash run the agent made", async () => {
+  const { dir, hooks, call, callAs, emit, j } = await harness()
+  try {
+    await readyRun(call, "cap")
+    await call("design_dispatch", { slug: "cap" })
+    const architect = (await readState(dir, "cap")).dispatch.child_session_id
+    await callAs(architect)("design_respond", { response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    await emit({ type: "session.idle", properties: { sessionID: architect } })
+    const falsifier = (await readState(dir, "cap")).dispatch.child_session_id
+    const asFalsifier = callAs(falsifier)
+    const lie = { slug: "cap", class: "executable", command: "echo hi", output: "LIES", exit_code: 7 }
+    expect(j(await asFalsifier("design_record_evidence", lie)).ok).toBe(false)
+    await hooks["tool.execute.after"]({ tool: "bash", sessionID: falsifier, callID: "c", args: { command: "echo hi" } }, { title: "", output: "hi\n", metadata: { exit: 0 } })
+    const res = j(await asFalsifier("design_record_evidence", lie))
+    expect(res.ok).toBe(true)
+    expect(res.captured).toBe(true)
+    const ev = (await readState(dir, "cap")).evidence.find((e: any) => e.id === res.id)
+    expect(ev.output_preview).toBe("hi\n")
+    expect(ev.exit_code).toBe(0)
+    // The Referee's own evidence is still self-reported.
+    const ref = j(await call("design_record_evidence", { slug: "cap", class: "executable", command: "ls", output: "typed", exit_code: 0 }))
+    expect(ref.ok).toBe(true)
+    expect(ref.captured).toBe(false)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a held finding gates until the user decides; reused ids are rejected; the ruling re-scores the finished run", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await readyRun(call, "held") // fast: 3 rounds, k 2
+    await call("design_respond", { slug: "held", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    // Round 1: F-001 is rebutted without evidence (contested), F-002 is fixed.
+    await call("design_begin_round", { slug: "held" })
+    await call("design_submit_verdict", { slug: "held", verdict_json: findingsVerdict(1, ["F-001", "F-002"]) })
+    const weak = { finding_id: "F-001", disposition: "rebut", refutation_evidence: { class: "belief", detail: "no" } }
+    await call("design_respond", { slug: "held", response_json: JSON.stringify({ round: 1, responses: [weak, { finding_id: "F-002", disposition: "fix" }] }) })
+    // Round 2: the Falsifier does not re-raise F-001, yet it stays on the board, gating and escalated.
+    await call("design_begin_round", { slug: "held" })
+    const reuse = j(await call("design_submit_verdict", { slug: "held", verdict_json: findingsVerdict(2, ["F-002"]) }))
+    expect(reuse.ok).toBe(false)
+    expect(reuse.error).toContain("reuses the id")
+    expect(reuse.error).toContain("F-003")
+    await call("design_submit_verdict", { slug: "held", verdict_json: cleanVerdict(2, fullCov) })
+    await call("design_respond", { slug: "held", response_json: JSON.stringify({ round: 2, responses: [] }) })
+    let st = await readState(dir, "held")
+    expect(st.open_findings.find((f: any) => f.id === "F-001")).toMatchObject({ round: 1, contested: true, held: true })
+    expect(st.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
+    expect(st.history[1]).toMatchObject({ gate: 1, round_gate: 0 })
+    // Round 3 is clean but F-001 still gates: the budget runs out.
+    await call("design_begin_round", { slug: "held" })
+    await call("design_submit_verdict", { slug: "held", verdict_json: cleanVerdict(3, fullCov) })
+    await call("design_respond", { slug: "held", response_json: JSON.stringify({ round: 3, responses: [] }) })
+    expect((await readState(dir, "held")).phase).toBe("budget_stopped")
+    // The user's ruling was all it waited for.
+    const decided = j(await call("design_decide", { slug: "held", finding_id: "F-001", decision: "resolved" }))
+    expect(decided.status.phase).toBe("converged")
+    st = await readState(dir, "held")
+    expect(st.escalations.length).toBe(0)
+    expect(await fs.readFile(path.join(dir, "docs", "design", "held", "08-open-issues.md"), "utf8")).toContain("Terminal phase: converged")
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("an acceptance resting on Architect fixes waits for a verification round", async () => {
+  for (const reraise of [false, true]) {
+    const { dir, client, hooks, call, j } = await harness()
+    try {
+      const slug = reraise ? "vfail" : "vok"
+      await readyRun(call, slug) // fast: 3 rounds, k 2
+      await call("design_respond", { slug, response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+      for (const r of [1, 2, 3]) {
+        const id = `F-00${r}`
+        await call("design_begin_round", { slug })
+        expect(j(await call("design_submit_verdict", { slug, verdict_json: findingsVerdict(r, [id]) })).ok).toBe(true)
+        await call("design_respond", { slug, response_json: JSON.stringify({ round: r, responses: [{ finding_id: id, disposition: "fix" }] }) })
+      }
+      let st = await readState(dir, slug)
+      expect(st.phase).toBe("designing")
+      expect(st.verify.ids).toContain("F-003")
+      await call("design_dispatch", { slug })
+      const last = promptText((client.prompts as any[])[client.prompts.length - 1])
+      expect(last).toContain("VERIFICATION PASS")
+      expect(last).toContain("F-003")
+      if (!reraise) {
+        expect(j(await call("design_submit_verdict", { slug, verdict_json: cleanVerdict(4, fullCov) })).ok).toBe(true)
+        st = await readState(dir, slug)
+        expect(st.phase).toBe("accepted_with_reservations")
+      } else {
+        const ev = j(await call("design_record_evidence", { slug, class: "executable", command: "x", output: "still broken" }))
+        const v = JSON.parse(findingsVerdict(4, ["F-003"]))
+        v.findings[0].evidence = { class: "executable", verification: "verified", artifact_id: ev.id }
+        expect(j(await call("design_submit_verdict", { slug, verdict_json: JSON.stringify(v) })).ok).toBe(true)
+        st = await readState(dir, slug)
+        expect(st.phase).toBe("budget_stopped")
+        expect(st.stop_reason).toBe("fix_not_verified")
+      }
+    } finally {
+      await hooks.dispose?.()
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test("a Falsifier-requested finding is escalated at verdict time, stays held after an Architect fix, and reopens as binding", async () => {
+  const { dir, client, ctx, hooks, call, j } = await harness()
+  try {
+    await readyRun(call, "ask")
+    await call("design_respond", { slug: "ask", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    await call("design_begin_round", { slug: "ask" })
+    const v = JSON.parse(findingsVerdict(1, ["F-001"]))
+    v.findings[0].action = "needs_adjudication"
+    expect(j(await call("design_submit_verdict", { slug: "ask", verdict_json: JSON.stringify(v) })).ok).toBe(true)
+    let st = await readState(dir, "ask")
+    expect(st.phase).toBe("responding")
+    expect(st.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
+    expect((client.prompts as any[]).some((p) => p?.path?.id === ctx.sessionID && promptText(p).includes("F-001"))).toBe(true)
+    await call("design_respond", { slug: "ask", response_json: JSON.stringify({ round: 1, responses: [{ finding_id: "F-001", disposition: "fix" }] }) })
+    st = await readState(dir, "ask")
+    expect(st.open_findings.find((f: any) => f.id === "F-001")).toMatchObject({ status: "needs_adjudication", contested: true })
+    expect(st.history[0].gate).toBe(1)
+    await call("design_decide", { slug: "ask", finding_id: "F-001", decision: "reopen" })
+    st = await readState(dir, "ask")
+    expect(st.adjudications["F-001"]).toEqual({ decision: "binding", round: 1 })
+    expect(st.open_findings.find((f: any) => f.id === "F-001").status).toBe("binding")
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("root hand-off lists subsystem loose ends", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await soloRoot(call, j, dir)
+    await call("design_decompose", { slug: "solo", decomposition_json: JSON.stringify(soloManifest) })
+    const child = await readState(dir, "solo--svc")
+    child.open_findings = [{ id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold" }]
+    await writeState(dir, "solo--svc", child)
+    const h = JSON.parse(await call("design_get_context", { slug: "solo", role: "falsifier" }))
+    expect(h.subsystem_loose_ends).toEqual([{ subsystem: "SVC", id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold" }])
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("design_amend_requirement rewrites the ledger, keeps history, and rejects bad calls", async () => {
+  const { dir, hooks, call, callAs, j } = await harness()
+  try {
+    await readyRun(call, "amd")
+    expect(j(await call("design_amend_requirement", { slug: "amd", id: "R-999", text: "x", reason: "t" })).ok).toBe(false)
+    expect(j(await call("design_amend_requirement", { slug: "amd", id: "R-001", reason: "t" })).ok).toBe(false)
+    expect(j(await call("design_amend_requirement", { slug: "amd", id: "R-001", text: "new text", reason: "user ruling on F-006" })).ok).toBe(true)
+    const st = await readState(dir, "amd")
+    expect(st.requirements.version).toBe(2)
+    expect(st.requirements.items[0].text).toBe("new text")
+    expect(st.requirements.items[0].amended[0]).toMatchObject({ version: 2, reason: "user ruling on F-006", before: { text: "r", priority: "must" } })
+    const md = await fs.readFile(`${dir}/docs/design/amd/01-requirements.md`, "utf8")
+    expect(md).toContain("new text (amended v2)")
+    await call("design_dispatch", { slug: "amd" })
+    const child = (await readState(dir, "amd")).dispatch.child_session_id
+    await expect(callAs(child)("design_amend_requirement", { slug: "amd", id: "R-001", text: "z", reason: "t" })).rejects.toThrow(/Referee only/)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+for (const mode of ["confirm", "auto"] as const) {
+  test(`decompose root verifies closed majors before the hold opens (${mode})`, async () => {
+    const { dir, hooks, call, client, j } = await harness()
+    try {
+      await call("design_start", { system: "vr", brief: "b", slug: "vr", mode: "fast", decompose: true, decomposition: mode })
+      await call("design_add_requirement", { slug: "vr", text: "sys", priority: "must" })
+      await call("design_confirm_requirements", { slug: "vr" })
+      await call("design_respond", { slug: "vr", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+      await fs.writeFile(path.join(dir, "docs", "design", "vr", "decomposition.json"), JSON.stringify(twoSubManifest("vr")))
+      await call("design_begin_round", { slug: "vr" })
+      expect(j(await call("design_submit_verdict", { slug: "vr", verdict_json: findingsVerdict(1, ["F-001"]) })).ok).toBe(true)
+      await call("design_respond", { slug: "vr", response_json: JSON.stringify({ round: 1, responses: [{ finding_id: "F-001", disposition: "fix" }] }) })
+      const s = await readState(dir, "vr")
+      expect(s.phase).toBe("designing")
+      expect(s.verify.target).toBe("awaiting_decomposition")
+      expect(s.verify.ids).toContain("F-001")
+      expect(s.subsystems.length).toBe(0)
+      await call("design_dispatch", { slug: "vr" })
+      const last = promptText(client.prompts[client.prompts.length - 1])
+      expect(last).toContain("VERIFICATION PASS")
+      expect(last).toContain("split into subsystems")
+      expect(j(await call("design_submit_verdict", { slug: "vr", verdict_json: cleanVerdict(2, fullCov) })).ok).toBe(true)
+      const end = await readState(dir, "vr")
+      if (mode === "confirm") {
+        expect(end.phase).toBe("awaiting_decomposition")
+        expect(end.decomposition_ready).toBe(true)
+      } else {
+        expect(end.subsystems.length).toBe(2)
+        expect(end.phase).toBe("designing")
+      }
+    } finally {
+      await hooks.dispose?.()
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+test("design_amend_requirement is allowed mid-round (responding) but not on a terminal run", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await readyRun(call, "amr")
+    await call("design_respond", { slug: "amr", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    await call("design_begin_round", { slug: "amr" })
+    expect(j(await call("design_submit_verdict", { slug: "amr", verdict_json: findingsVerdict(1, ["F-001"]) })).ok).toBe(true)
+    expect((await readState(dir, "amr")).phase).toBe("responding")
+    expect(j(await call("design_amend_requirement", { slug: "amr", id: "R-001", text: "ruled", reason: "user ruling" })).ok).toBe(true)
+    expect((await readState(dir, "amr")).requirements.items[0].text).toBe("ruled")
+    await call("design_stop", { slug: "amr" })
+    expect(j(await call("design_amend_requirement", { slug: "amr", id: "R-001", text: "late", reason: "t" })).ok).toBe(false)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("shell.env marks dispatched sessions only", async () => {
+  const { dir, hooks, call } = await harness()
+  try {
+    await readyRun(call, "env")
+    await call("design_dispatch", { slug: "env" })
+    const child = (await readState(dir, "env")).dispatch.child_session_id
+    const env = async (sessionID: string) => {
+      const output = { env: {} as Record<string, string> }
+      await hooks["shell.env"]({ cwd: dir, sessionID, callID: "c" }, output)
+      return output.env
+    }
+    expect(await env(child)).toEqual({ CRUCIBLE_SESSION: child, CRUCIBLE_WORKTREE: dir, CRUCIBLE_SCRATCH: path.join(os.tmpdir(), "opencode", "crucible", "env") })
+    expect(await env("ses_user")).toEqual({})
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test.skipIf(process.platform !== "linux")("a finished turn kills processes marked with its session", async () => {
+  const { dir, hooks, call, emit } = await harness()
+  const sleeps: ReturnType<typeof Bun.spawn>[] = []
+  try {
+    await readyRun(call, "reap")
+    await call("design_dispatch", { slug: "reap" })
+    const child = (await readState(dir, "reap")).dispatch.child_session_id
+    const marked = Bun.spawn(["sleep", "300"], { env: { ...process.env, CRUCIBLE_SESSION: child } })
+    const other = Bun.spawn(["sleep", "300"])
+    sleeps.push(marked, other)
+    await emit({ type: "session.status", properties: { sessionID: child, status: { type: "busy" } } })
+    await emit({ type: "session.idle", properties: { sessionID: child } })
+    const timeout = new Promise((r) => setTimeout(() => r("alive"), 3000))
+    expect(await Promise.race([marked.exited, timeout])).not.toBe("alive")
+    expect(() => process.kill(other.pid, 0)).not.toThrow()
+  } finally {
+    for (const p of sleeps) p.kill("SIGKILL")
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("permission.asked under guarded: rejected with feedback through the server so the agent continues", async () => {
+  const replies: any[] = []
+  const api = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      replies.push({ path: new URL(req.url).pathname, body: await req.json() })
+      return Response.json(true)
+    },
+  })
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "crucible-work-"))
+  const client = makeClient()
+  const hooks: any = await server({ client, directory: dir, serverUrl: new URL(`http://127.0.0.1:${api.port}`) }, {})
+  const ctx = { sessionID: "ses_referee", directory: dir, messageID: "m", agent: "crucible", worktree: dir }
+  const call = (name: string, args: any) => hooks.tool[name].execute(args, ctx)
+  try {
+    await readyRun(call, "fb")
+    await call("design_dispatch", { slug: "fb" })
+    const child = (await readState(dir, "fb")).dispatch.child_session_id
+    await hooks.event({ event: asked(child) })
+    await drainEvents()
+    expect(replies.length).toBe(1)
+    expect(replies[0].path).toBe("/permission/per_1/reply")
+    expect(replies[0].body.reply).toBe("reject")
+    expect(replies[0].body.message).toContain("Refused automatically")
+    // The bare SDK rejection (which would end the agent's turn) is only a fallback.
+    expect(client.rejects.length).toBe(0)
+  } finally {
+    api.stop(true)
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("dispatched bash docker/podman runs are labelled; scratch dir is per run", async () => {
+  const { dir, client, hooks, call } = await harness()
+  try {
+    await readyRun(call, "sc")
+    await call("design_dispatch", { slug: "sc" })
+    const child = (await readState(dir, "sc")).dispatch.child_session_id
+    const run = async (sessionID: string, command: string) => {
+      const output = { args: { command } }
+      await hooks["tool.execute.before"]({ tool: "bash", sessionID, callID: "c" }, output)
+      return output.args.command
+    }
+    const a = await run(child, "docker run --rm -d postgres:16")
+    expect(a).toContain(`docker run --label crucible.session=${child} --label crucible.worktree='${dir}' --rm`)
+    expect(await run(child, "podman container run alpine")).toContain(`--label crucible.session=${child}`)
+    expect(await run("ses_user", "docker run alpine")).toBe("docker run alpine")
+    expect(await run(child, "echo docker running")).toBe("echo docker running")
+
+    const env: any = { env: {} }
+    await hooks["shell.env"]({ sessionID: child }, env)
+    expect(env.env.CRUCIBLE_SCRATCH.endsWith("/crucible/sc")).toBe(true)
+    expect((await fs.stat(env.env.CRUCIBLE_SCRATCH)).isDirectory()).toBe(true)
+    const last = client.prompts[client.prompts.length - 1]
+    expect(promptText(last)).toContain(env.env.CRUCIBLE_SCRATCH)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })

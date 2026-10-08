@@ -39,10 +39,10 @@ does its work, then calls its terminal tool (\`design_respond\` for the Architec
 advances on session idle, with pending-attempt tracking, a watchdog, and a
 single retry per dispatch. The watchdog measures **inactivity, not duration**:
 any streamed output, tool call, status change, or permission event resets the
-window (default 30 min; per-run \`watchdog_ms\` or plugin \`watchdogMs\`), so a long
+window (default 10 min, 30 min while a tool call runs; per-run \`watchdog_ms\` or plugin \`watchdogMs\`), so a long
 but active turn is never interrupted for taking long. Only a turn that goes
 silent past the window is aborted and retried once, then the run stops with
-\`no_progress\` (\`stop_reason: watchdog_timeout\`).
+\`no_progress\` (\`stop_reason: watchdog_timeout\`). Child shell commands run without prompts under the \`guarded\` policy: directories outside the project are denied except the scratch directory, repeated identical calls and \`.env\` reads are denied, and a blocklist refuses destructive, remote-affecting, and repository-changing git commands. It is not a sandbox, so commit your work before a run. Processes an agent starts are killed when its turn ends; containers started with \`docker run\` or \`podman run\` are removed then too, so prefer \`--rm\`. Each run has its own scratch directory (given in the dispatch and as \`$CRUCIBLE_SCRATCH\`) for evidence scripts and data.
 
 ## Run layout
 
@@ -88,7 +88,7 @@ phase it was stopped from (recorded as \`stopped_from\`).
 
 The \`design_*\` tools are the only write path:
 
-\`design_start\`, \`design_add_requirement\`, \`design_confirm_requirements\`,
+\`design_start\`, \`design_add_requirement\`, \`design_amend_requirement\`, \`design_confirm_requirements\`,
 \`design_begin_round\`, \`design_record_evidence\`, \`design_record_decision\`,
 \`design_submit_verdict\`, \`design_respond\`, \`design_dispatch\`, \`design_decompose\`,
 \`design_decide\`, \`design_escalations\`, \`design_status\`, \`design_list\`,
@@ -115,7 +115,9 @@ Each subsystem is an ordinary run with \`parent_slug\`, a \`namespace\`, its own
 budget and namespaced ids; \`pumpChildren\` dispatches ready children in dependency
 order. The accepted manifest is persisted as
 \`docs/design/<root>/decomposition.json\` for auditability, and a subsystem
-inherits the root's budget tier unless the manifest names a \`mode\`.
+inherits the root's budget tier unless the manifest names a \`mode\`. The root's
+integration hand-off includes \`subsystem_loose_ends\` (subsystems' unresolved and
+accepted findings) so cross-subsystem gaps they left are not missed.
 
 **Manifest rules.** \`version\` must be a positive integer; subsystem \`name\` and
 \`namespace\` (an uppercase token, \`^[A-Z][A-Z0-9]*$\`) must be unique; each
@@ -139,7 +141,7 @@ The root's \`childrenGate\` (\`pending\` → \`waiting\` → \`ready\`/\`failed\
 when required children are \`converged\`/\`accepted_with_reservations\`; a required
 child that terminates unaccepted makes the root terminal \`blocked\`. A root
 finding carrying \`subsystem_ref\` blocks that child
-(\`acceptance_blocked_by_parent\`). Cross-run traceability links system and
+(\`acceptance_blocked_by_parent\`). The root's Architect cannot edit subsystem documents, so its \`fix\` on a finding with \`subsystem_ref\` keeps it open and gating while the plugin reopens that subsystem with it; it closes when a later root review no longer raises it. Cross-run traceability links system and
 subsystem requirements; uncovered must/should system requirements block root
 acceptance. An **interface gate** additionally holds root acceptance while a
 declared cross-subsystem interface is unsatisfiable or out of order: every
@@ -191,7 +193,11 @@ Record evidence with \`design_record_evidence\` (class, command, output,
 exit_code) before citing it, and put the returned id in the finding as
 \`evidence.artifact_id\`. An \`executable\` or \`model_checked\` finding without a
 recorded artifact is **downgraded to \`hypothesis\`** and will not gate
-convergence. Only \`verified\` strong-class evidence is binding; \`supported\` is
+convergence. Evidence recorded by a dispatched agent is taken from a bash
+command that agent actually ran in the current turn: run it with the bash tool,
+then call \`design_record_evidence\` with the same \`command\`; the plugin records
+the captured output and exit code and ignores typed-in ones. Evidence recorded by
+the Referee or user is taken as given. Only \`verified\` strong-class evidence is binding; \`supported\` is
 visible but does not gate. A finding with no \`requirement_ids\`/\`constraint_ref\`
 or no \`artifact_ref\` is rejected as noise.
 
@@ -273,12 +279,17 @@ Findings are classified in this order; the first match wins.
    (visible, does not gate).
 3. A \`fix\` disposition → \`resolved\`.
 4. A \`rebut\` with verified strong refutation evidence → \`resolved\`; otherwise
-   \`needs_adjudication\`.
-5. \`accept_risk\` → \`accepted_risk\`; \`wont_fix\` (justified deliberate non-fix)
-   → \`accepted_risk\`.
+   \`needs_adjudication\`. Executable/model_checked refutation evidence must cite a
+   recorded artifact (\`refutation_evidence.artifact_id\`, from
+   \`design_record_evidence\`), as for findings; \`design_respond\` rejects a
+   rebuttal claiming verified executable/model_checked evidence without one.
+5. \`accept_risk\` / \`wont_fix\` (justified deliberate non-fix) →
+   \`accepted_risk\` when the finding is not a verified (binding) blocker/major;
+   on a binding blocker/major → \`needs_adjudication\` (contested): it keeps
+   gating and goes to the user, who ratifies it ("Accept the risk") or reopens it.
 6. \`simplify\` (addressed by removing or reducing mechanism) → \`resolved\`.
 7. \`disputed\`, or \`action: "needs_adjudication"\` → \`needs_adjudication\`
-   (quarantined, does not gate).
+   (a Falsifier-requested ruling stays \`needs_adjudication\` whatever the Architect answers; it gates when verified and a blocker/major. Disputed ones don't gate, see escalations below).
 8. Strong class (\`executable\`/\`authoritative\`/\`model_checked\`) **and**
    \`verification: "verified"\` → \`binding\`.
 9. Strong class but only \`supported\` → \`supported\` (visible, does not gate).
@@ -289,10 +300,26 @@ Every finding ends as one of these; the plugin never silently drops one.
 ## Requirement ledger rules
 
 - The ledger is the source of truth but is **amendable**.
+- A ruling that changes what a requirement says should be followed by \`design_amend_requirement\`, which bumps the version and keeps the old text in its history.
 - The Falsifier may cite existing IDs and may file \`requirement_gap\` findings,
   which escalate to the user. List pending escalations with \`design_escalations\`
   and ratify one with \`design_decide\` (it locates the finding across the effort,
   root or subsystem).
+- A blocker/major in \`needs_adjudication\` that is contested, Falsifier-requested
+  (\`action: "needs_adjudication"\`), or \`disputed\` is escalated to the user and
+  HELD on the board across rounds until the user decides, even if the Falsifier
+  does not re-raise it; contested ones keep gating convergence until decided.
+  Falsifier-requested rulings are escalated at verdict time, while the Architect
+  works. The Architect's answer to one (even \`fix\`) is only a proposal, so it stays
+  \`needs_adjudication\` until the user rules; a verified one gates until then. The
+  loop does not pause for it, and the Architect may still answer a held finding
+  by its id in a later round. User rulings: "Ratify as resolved" accepts the
+  Architect's proposal; "Accept the risk" accepts the risk; "Reopen" means the
+  finding stands: it becomes an ordinary verified finding that the Architect must
+  answer (a \`fix\` then resolves it). A ruling re-scores the last scored round: a run
+  that is between rounds, \`budget_stopped\`, or \`no_progress\` only because of that
+  finding finishes as \`converged\` / \`accepted_with_reservations\` if it now
+  qualifies.
 - An escalation is surfaced as a **question dialog**: when one is raised (and
   again after a restart) the plugin prompts the Referee, which MUST call the
   \`question\` tool with per-item choices ("Ratify as resolved" / "Accept the
@@ -319,7 +346,9 @@ Every finding ends as one of these; the plugin never silently drops one.
 ## Coverage-over-testability
 
 The plugin maintains a coverage matrix across the dimensions in the verdict
-schema. Convergence requires a complete matrix regardless of which dimensions
+schema, counting those examined in the last \`k\` rounds (since integration began,
+for decompose roots), not ever. The Falsifier lists in \`coverage.examined\` what
+it examined this round. Convergence requires a complete matrix regardless of which dimensions
 are easy to test. Argument-class findings stay visible even when they cannot be
 verified.
 
@@ -329,7 +358,7 @@ Converged when all hold:
 
 - zero binding blockers;
 - binding majors ≤ \`majors_threshold\` (default 0);
-- no new validated blocker/major in the last \`k\` rounds (default 2);
+- no new validated blocker/major in the last \`k\` rounds (default 2; verified findings put to the user count);
 - coverage matrix complete;
 - the design is within the spec-size budget (\`max_spec_lines\`, per mode);
 - the Falsifier self-certifies \`no_new_falsifiable_claim\` for the round.
@@ -351,7 +380,9 @@ case: the Architect resolves every finding, yet the Falsifier keeps finding one
 more. It is a distinct, honest terminal rather than a false \`converged\`.
 Requiring the count to settle at one (rather than merely "at most one", which a
 zero-finding round would also satisfy) avoids accepting during early
-exploration, and leaves a run that has gone quiet to converge instead.
+exploration, and leaves a run that has gone quiet to converge instead. A run also ends \`accepted_with_reservations\` when the last \`k\` rounds found only minors (no blocker or major findings), and those minors become the reservations; quiet rounds with no findings still wait for the Falsifier's self-certification.
+
+**Verification pass.** When an acceptance (\`converged\` or \`accepted_with_reservations\`), or a decompose root's entry into \`awaiting_decomposition\`, would rest on blocker/major findings that the Architect closed in that same round with \`fix\` or \`simplify\`, the plugin first runs one more Falsifier round (even past the round budget) to check those fixes. The dispatch lists them. The Falsifier re-raises any fix that does not hold, by its same id with evidence recorded this round. If no binding blocker/major remains after that verdict, the acceptance stands (or the decomposition hold opens) without another Architect turn. Otherwise the run continues as a normal round if it is within budget, or ends \`budget_stopped\` (\`stop_reason: fix_not_verified\`).
 
 Budget tiers (\`mode\`), all using one reused child session per role:
 
@@ -361,9 +392,11 @@ Budget tiers (\`mode\`), all using one reused child session per role:
 
 Terminal states: \`converged\`; \`accepted_with_reservations\`; \`budget_stopped\`
 (best revision plus residual findings and an explicit "not fully converged"
-status); \`no_progress\` (the **unresolved** binding gate did not decrease over
-\`m=2\` rounds — the Architect is failing to clear findings); \`stopped\` (user). On
-terminal the plugin writes \`08-open-issues.md\`, updates the session title, and
+status); \`no_progress\` (the gating findings raised in each round that the Architect left
+**unresolved** did not decrease over \`m=2\` rounds; findings held over for the
+user do not count); \`stopped\` (user). On
+terminal the plugin writes \`08-open-issues.md\` (its "Accepted risks" lists accepted
+risks from every round, and who accepted them), updates the session title, and
 raises a toast.
 
 \`design_resume\` reopens any terminal run at the phase it stopped from (user
@@ -376,12 +409,17 @@ stops record \`stopped_from\`; other terminals continue into a fresh round).
   configuration. Agents never write \`.crucible/\` state, the Falsifier writes only
   \`07-review-log.md\`, and the Architect never edits the brief, requirements,
   review log, or open issues.
+- Dispatched agents (the Architect and Falsifier) write files only inside their own run directory (the working directory in their dispatch); scratch files may go under opencode's temp directory (e.g. /tmp/opencode). The plugin refuses edits anywhere else in the project.
+- Dispatched agents may use only read-only git (status, log, diff, show, blame, grep); the plugin refuses any command that changes the repository.
 - The Referee never fabricates agent output; it reads the actual tools and
   files.
 - The Falsifier never edits design artifacts; the Architect never edits the
   review log, verdicts, or state.
 - Every finding cites a requirement id or constraint and an artifact section;
   uncited findings are rejected as noise.
-- The Falsifier must not re-raise a \`resolved\` finding without new evidence.
+- New findings are numbered from \`next_finding_id\` in the hand-off
+  (\`design_get_context\`). Keeping an old id means re-raising that same finding;
+  the plugin rejects a verdict that reuses the id of a resolved finding unless it
+  cites evidence recorded this round.
 - The loop must be stoppable by the user at any time.
 `

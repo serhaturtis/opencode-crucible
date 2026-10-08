@@ -131,7 +131,7 @@ const TERMINAL = new Set([
 // A dispatched turn with no activity longer than the run's watchdog window is shown as stalled.
 const STALL_MS = (() => {
   const n = Number(process.env.CRUCIBLE_WATCHDOG_MS)
-  return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000
+  return Number.isFinite(n) && n > 0 ? n : 10 * 60 * 1000
 })()
 
 type Activity = { icon: string; label: string }
