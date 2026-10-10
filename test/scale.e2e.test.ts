@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-// End-to-end plugin tests with a fake SDK client and a temp worktree (no opencode, no live agents).
+// End-to-end plugin tests with a fake V2 plugin context and a temp worktree (no opencode, no live agents).
 const dataHome = await fs.mkdtemp(path.join(os.tmpdir(), "crucible-data-"))
 process.env.XDG_DATA_HOME = dataHome
 afterAll(async () => {
@@ -11,15 +11,16 @@ afterAll(async () => {
 })
 
 const serverModule = await import("../src/server")
-const { server } = serverModule
+const plugin = serverModule.default
 const { drainEvents } = await import("../src/events")
 
-// opencode calls every function the plugin module exports as a plugin factory.
-test("the server module exports only the plugin factory", () => {
-  expect(Object.keys(serverModule)).toEqual(["server"])
+test("the server module default-exports the V2 plugin", () => {
+  expect(Object.keys(serverModule)).toEqual(["default"])
+  expect(plugin.id).toBe("opencode-crucible")
+  expect(typeof plugin.setup).toBe("function")
 })
 
-// The fake SDK client: failed calls return { error } instead of throwing.
+// The fake context: session calls throw on failure, as the V2 context does.
 function makeClient(opts: { promptError?: (args: any) => any; status?: () => any } = {}) {
   let n = 0
   const prompts: any[] = []
@@ -27,43 +28,52 @@ function makeClient(opts: { promptError?: (args: any) => any; status?: () => any
   const creates: any[] = []
   const updates: any[] = []
   const rejects: any[] = []
+  const switches: any[] = []
   const session: any = {
+    async get(args: any) {
+      return { id: args.sessionID, agent: "build" }
+    },
     async create(args: any) {
       creates.push(args)
-      return { data: { id: `ses_${++n}` } }
+      return { id: `ses_${++n}` }
     },
-    async promptAsync(args: any) {
+    async prompt(args: any) {
       prompts.push(args)
       const error = opts.promptError?.(args)
-      return error ? { error } : { data: undefined }
+      if (error) throw error
+      return { id: "inbox" }
     },
     async update(args: any) {
       updates.push(args)
-      return { data: undefined }
+      return undefined
     },
-    async abort(args: any) {
+    async switchAgent(args: any) {
+      switches.push(args)
+      return undefined
+    },
+    async switchModel() {
+      return undefined
+    },
+    async interrupt(args: any) {
       aborts.push(args)
-      return { data: undefined }
+      return undefined
     },
-    async messages() {
-      return { data: [] }
+    async active() {
+      return opts.status ? opts.status!() : {}
     },
   }
-  if (opts.status) session.status = async () => ({ data: opts.status!() })
   return {
     prompts,
     aborts,
     creates,
     updates,
     rejects,
-    async postSessionIdPermissionsPermissionId(args: any) {
-      rejects.push(args)
-      return { data: true }
-    },
+    switches,
     session,
-    tui: {
-      async showToast() {
-        return { data: true }
+    permission: {
+      async reply(args: any) {
+        rejects.push(args)
+        return undefined
       },
     },
   }
@@ -102,22 +112,170 @@ const findingsVerdict = (round: number, ids: string[]) =>
     no_new_falsifiable_claim: false,
   })
 
+// A fake V2 plugin context: captures the registrations the plugin makes and feeds events.
+function makeContext(client: any, options: any, dir: string) {
+  const tools: Record<string, any> = {}
+  const toolHooks: Record<string, any> = {}
+  const permissionHooks: Record<string, any> = {}
+  const sessionHooks: Record<string, any> = {}
+  const agents: Record<string, any> = {}
+  const commands: Record<string, any> = {}
+  const events: any[] = []
+  const pending: Array<(r: IteratorResult<any>) => void> = []
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => {
+          const value = events.shift()
+          if (value !== undefined) return Promise.resolve<IteratorResult<any>>({ value, done: false })
+          return new Promise<IteratorResult<any>>((resolve) => pending.push(resolve))
+        },
+        return: async () => ({ value: undefined, done: true }) as IteratorResult<any>,
+      }
+    },
+  }
+  const pushEvent = (event: any) => {
+    const resolve = pending.shift()
+    if (resolve) resolve({ value: event, done: false })
+    else events.push(event)
+  }
+  const editor = () => ({
+    list: () => [],
+    get: () => undefined,
+    update: () => {},
+    remove: () => {},
+    namespace: () => {},
+    add: () => {},
+  })
+  const registration = { dispose: async () => {} }
+  const session: any = Object.assign(client.session, {
+    hook: async (name: string, callback: any) => {
+      sessionHooks[name] = callback
+      return registration
+    },
+  })
+  const permission: any = Object.assign(client.permission, {
+    hook: async (name: string, callback: any) => {
+      permissionHooks[name] = callback
+      return registration
+    },
+  })
+  const ctx: any = {
+    options,
+    location: { directory: dir },
+    session,
+    permission,
+    event: { subscribe: () => stream },
+    tool: {
+      transform: async (callback: any) => {
+        const draft = editor()
+        draft.add = (tool: any) => {
+          tools[tool.name] = tool
+        }
+        callback(draft)
+        return registration
+      },
+      hook: async (name: string, callback: any) => {
+        toolHooks[name] = callback
+        return registration
+      },
+    },
+    agent: {
+      transform: async (callback: any) => {
+        const draft: any = editor()
+        draft.list = () => Object.values(agents)
+        draft.get = (id: string) => agents[id]
+        draft.update = (id: string, update: any) => {
+          if (!agents[id]) agents[id] = { id, name: id, permissions: [] }
+          update(agents[id])
+        }
+        draft.remove = (id: string) => {
+          delete agents[id]
+        }
+        callback(draft)
+        return registration
+      },
+    },
+    command: {
+      transform: async (callback: any) => {
+        const draft: any = editor()
+        draft.add = (command: any) => {
+          commands[command.name] = command
+        }
+        callback(draft)
+        return registration
+      },
+    },
+  }
+  return { ctx, tools, toolHooks, permissionHooks, sessionHooks, agents, commands, pushEvent }
+}
+
 async function harness(options: any = {}, clientOpts: any = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "crucible-work-"))
   const client = makeClient(clientOpts)
-  const hooks: any = await server({ client, directory: dir }, options)
-  const ctx = { sessionID: `ses_${Math.random().toString(36).slice(2)}`, directory: dir, messageID: "m", agent: "crucible", worktree: dir }
-  const call = (name: string, args: any) => hooks.tool[name].execute(args, ctx)
+  const fake = makeContext(client, options, dir)
+  const cleanup = await plugin.setup(fake.ctx)
+  const ctx = { sessionID: `ses_${Math.random().toString(36).slice(2)}`, agent: "build", messageID: "m", id: "call" }
+  // The host decodes tool input and passes the result content to the model; tests read the content.
+  const call = async (name: string, args: any) => (await fake.tools[name].execute(args, ctx)).content
   // Call a tool as another session (e.g. a dispatched child agent).
-  const callAs = (sessionID: string) => (name: string, args: any) => hooks.tool[name].execute(args, { ...ctx, sessionID })
+  const callAs = (sessionID: string) => async (name: string, args: any) => (await fake.tools[name].execute(args, { ...ctx, sessionID })).content
   // Deliver a bus event and wait until the plugin has handled it.
   const emit = async (event: any) => {
-    await hooks.event({ event })
+    fake.pushEvent(event)
+    await new Promise((resolve) => setTimeout(resolve, 0))
     await drainEvents()
+  }
+  const hooks = {
+    dispose: cleanup,
+    toolBefore: fake.toolHooks["execute.before"],
+    toolAfter: fake.toolHooks["execute.after"],
+    permissionEvaluate: fake.permissionHooks["evaluate"],
+    compaction: fake.sessionHooks["compaction"],
+    agents: fake.agents,
+    commands: fake.commands,
+    tools: fake.tools,
   }
   const j = (s: string) => JSON.parse(s)
   return { dir, client, hooks, ctx, call, callAs, emit, j }
 }
+
+test("the V2 setup registers agents, the referee command, direct tools, and the compaction hook", async () => {
+  const { dir, client, hooks, call, ctx } = await harness()
+  try {
+    // Agents: the plugin owns prompt and mode; they are subagents.
+    expect(hooks.agents.architect.mode).toBe("subagent")
+    expect(hooks.agents.architect.system).toContain("Crucible Architect")
+    expect(hooks.agents.falsifier.system).toContain("Crucible Falsifier")
+
+    // Tools: registered as direct (not code-mode) tools with JSON Schema input.
+    expect(Object.keys(hooks.tools)).toContain("design_start")
+    expect(hooks.tools.design_protocol.options).toEqual({ codemode: false })
+    expect(hooks.tools.design_start.input.type).toBe("object")
+    expect(hooks.tools.design_start.input.properties.system.type).toBe("string")
+
+    // The /crucible command submits the Referee prompt under the build agent.
+    expect(hooks.commands.crucible).toBeTruthy()
+    await hooks.commands.crucible.execute({ sessionID: ctx.sessionID, prompt: { text: "list" }, delivery: "steer" })
+    const ref = client.prompts.find((p: any) => p.sessionID === ctx.sessionID)
+    expect(ref.text).toContain("You are the Crucible Referee")
+    expect(ref.text).toContain("Arguments:\n\nlist")
+    expect(client.switches.length).toBe(0) // the fake session already runs build
+
+    // The compaction hook keeps the run state in the summary prompt.
+    await readyRun(call, "cmp")
+    await call("design_dispatch", { slug: "cmp" })
+    const child = (await readState(dir, "cmp")).dispatch.child_session_id
+    const system: any[] = []
+    await hooks.compaction({ sessionID: child, system })
+    expect(system.length).toBe(1)
+    expect(system[0].text).toContain("Crucible run 'cmp'")
+    expect(system[0].text).toContain("do not re-elicit")
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
 
 test("design_protocol returns the in-code protocol", async () => {
   const { dir, hooks, call } = await harness()
@@ -328,8 +486,8 @@ test("per-run configuration is recorded and applied to dispatch", async () => {
     await call("design_confirm_requirements", { slug: "cfg" })
     await call("design_dispatch", { slug: "cfg" }) // dispatches the Architect (initial design)
 
-    const architect = (client.prompts as any[]).find((p) => p?.body?.agent === "architect")
-    expect(architect.body.model).toEqual({ providerID: "openai", modelID: "gpt-x" })
+    const architect = (client.creates as any[]).find((c) => c?.agent === "architect")
+    expect(architect.model).toEqual({ providerID: "openai", id: "gpt-x" })
 
     const st = await readState(dir, "cfg")
     expect(st.budgets.mode).toBe("deep")
@@ -790,9 +948,9 @@ test("a decompose root without a manifest wakes the Referee", async () => {
     const held = await readState(dir, "nm")
     expect(held.phase).toBe("awaiting_decomposition")
     // The Referee runs under the built-in build agent so it has the question tool.
-    const ref = (client.prompts as any[]).find((p) => p?.path?.id === ctx.sessionID && p?.body?.agent === "build")
+    const ref = (client.prompts as any[]).find((p) => p?.sessionID === ctx.sessionID)
     expect(ref).toBeTruthy()
-    expect(JSON.stringify(ref.body.parts)).toContain("question")
+    expect(ref.text).toContain("question")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -891,7 +1049,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 test("watchdog measures inactivity, not total turn duration", async () => {
   // A deliberately tiny window so the test runs in ~1s.
-  const { dir, client, hooks, call, j } = await harness({ watchdogMs: 120, watchdogSweepMs: 25 })
+  const { dir, client, hooks, call, j, emit } = await harness({ watchdogMs: 120, watchdogSweepMs: 25 })
   try {
     await call("design_start", { system: "Watch", brief: "b", slug: "watch", mode: "fast" })
     await call("design_add_requirement", { slug: "watch", text: "r", priority: "must" })
@@ -902,8 +1060,7 @@ test("watchdog measures inactivity, not total turn duration", async () => {
     const child = st.dispatch.child_session_id
 
     // Keep the turn alive past the window with streamed activity.
-    const touch = () =>
-      hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: child } } } })
+    const touch = () => emit({ type: "session.text.delta", data: { sessionID: child, delta: "x" } })
     for (let i = 0; i < 12; i++) {
       await touch()
       await sleep(25)
@@ -986,11 +1143,11 @@ async function readyRun(call: any, slug: string, extra: any = {}) {
   await call("design_confirm_requirements", { slug })
 }
 
-const promptText = (p: any) => String(p?.body?.parts?.[0]?.text || "")
+const promptText = (p: any) => String(p?.text || "")
 
-test("an SDK-reported promptAsync failure drops the dead session and re-dispatches", async () => {
+test("a session prompt failure drops the dead session and re-dispatches", async () => {
   let failed = false
-  const { dir, client, hooks, call } = await harness({}, { promptError: () => (failed ? null : ((failed = true), { name: "NotFoundError", data: { message: "Session not found" } })) })
+  const { dir, client, hooks, call } = await harness({}, { promptError: () => (failed ? null : ((failed = true), new Error("Session not found"))) })
   try {
     await readyRun(call, "dead")
     await call("design_dispatch", { slug: "dead" })
@@ -999,7 +1156,7 @@ test("an SDK-reported promptAsync failure drops the dead session and re-dispatch
     expect(st.dispatch.child_session_id).toBe("ses_2") // a fresh session, not the dead one
     expect(st.sessions.architect).toBe("ses_2")
     expect(st.managed_sessions).not.toContain("ses_1")
-    expect(client.aborts.some((a: any) => a.path.id === "ses_1")).toBe(true)
+    expect(client.aborts.some((a: any) => a.sessionID === "ses_1")).toBe(true)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1012,12 +1169,12 @@ test("a subsystem that stalls out blocks its root, and the retry prompt nudges t
     await decomposeTwo(call, "stall")
     const child = (await readState(dir, "stall--a")).dispatch.child_session_id
     for (let i = 0; i < 2; i++) {
-      await emit({ type: "session.status", properties: { sessionID: child, status: { type: "busy" } } })
-      await emit({ type: "session.idle", properties: { sessionID: child } })
+      await emit({ type: "session.status", data: { sessionID: child, status: { type: "busy" } } })
+      await emit({ type: "session.idle", data: { sessionID: child } })
       if (i === 0) {
         // Re-dispatched after a turn that ended without design_respond.
         const last = client.prompts[client.prompts.length - 1]
-        expect(last.path.id).toBe(child)
+        expect(last.sessionID).toBe(child)
         expect(promptText(last)).toContain("ended without calling design_respond")
       }
     }
@@ -1051,7 +1208,7 @@ test("an integration rejection is reworked, the subsystem re-accepts, and the ro
     await call("design_submit_verdict", { slug: "solo", verdict_json: JSON.stringify(rej) })
     await call("design_respond", { slug: "solo", response_json: JSON.stringify({ round: root.round, design_revision: "v4", responses: [] }) })
     // The root's turn ends; it waits for the reworking subsystem.
-    await emit({ type: "session.idle", properties: { sessionID: rootTurn } })
+    await emit({ type: "session.idle", data: { sessionID: rootTurn } })
     root = await readState(dir, "solo")
     expect(root.dispatch).toBe(null)
     expect(root.waiting_on).toEqual(["solo--svc"])
@@ -1158,17 +1315,17 @@ test("subsystems inherit the root's settings; a re-ingest neither rewinds the ro
   }
 })
 
-test("an aborted turn's MessageAbortedError does not consume the retry; a real error does", async () => {
+test("an interrupted execution does not consume the retry; a failed one does", async () => {
   const { dir, client, hooks, call, emit } = await harness()
   try {
     await readyRun(call, "abrt")
     await call("design_dispatch", { slug: "abrt" })
     const child = (await readState(dir, "abrt")).dispatch.child_session_id
-    await emit({ type: "session.error", properties: { sessionID: child, error: { name: "MessageAbortedError", data: { message: "aborted" } } } })
+    await emit({ type: "session.execution.interrupted", data: { sessionID: child } })
     let st = await readState(dir, "abrt")
     expect(st.dispatch.retries).toBe(0)
     expect(client.prompts.length).toBe(1)
-    await emit({ type: "session.error", properties: { sessionID: child, error: { name: "APIError", data: { message: "overloaded" } } } })
+    await emit({ type: "session.execution.failed", data: { sessionID: child, error: { type: "unknown", message: "overloaded" } } })
     st = await readState(dir, "abrt")
     expect(st.dispatch.retries).toBe(1)
     expect(client.prompts.length).toBe(2)
@@ -1195,8 +1352,7 @@ test("recovery re-drives a turn the restart killed, and never touches another wo
     reg["ses_far"] = { current: "far", runs: { far: { dir: other, at: new Date().toISOString() } } }
     await fs.writeFile(regFile, JSON.stringify(reg))
 
-    await hooks.config({}) // schedules recovery for this worktree
-    await sleep(2300)
+    await sleep(2300) // recovery is scheduled 2s after the plugin instance loads
     const after = await readState(dir, "rec")
     // The young dispatch was dead: re-driven at once.
     expect(after.dispatch).toBeTruthy()
@@ -1212,20 +1368,23 @@ test("recovery re-drives a turn the restart killed, and never touches another wo
   }
 })
 
-const hasRule = (rules: any[], permission: string, pattern: string, action: string) =>
-  rules.some((r) => r.permission === permission && r.pattern === pattern && r.action === action)
+const hasRule = (rules: any[], action: string, resource: string, effect: string) =>
+  rules.some((r) => r.action === action && r.resource === resource && r.effect === effect)
 
 test("shell policy: child sessions get policy rules; destructive is denied", async () => {
-  for (const [options, ext, bash] of [[{ shellPolicy: "ask" }, "ask", "ask"], [{}, "deny", "allow"]] as const) {
+  for (const [options, ext, shell] of [[{ shellPolicy: "ask" }, "ask", "ask"], [{}, "deny", "allow"]] as const) {
     const { dir, client, hooks, call } = await harness(options)
     try {
       await readyRun(call, "sh")
       await call("design_dispatch", { slug: "sh" })
       const child = (await readState(dir, "sh")).dispatch.child_session_id
-      const rules = client.creates.at(-1).body.permission
-      expect(hasRule(rules, "bash", "*", bash)).toBe(true)
+      const rules = client.creates.at(-1).permissions
+      expect(hasRule(rules, "shell", "*", shell)).toBe(true)
       expect(hasRule(rules, "external_directory", "*", ext)).toBe(true)
-      await expect(hooks["tool.execute.before"]({ tool: "bash", sessionID: child, callID: "c" }, { args: { command: "rm -rf /" } })).rejects.toThrow(/Crucible guard/)
+      const event: any = { action: "shell", sessionID: child, resources: ["rm -rf /"], effect: "allow" }
+      await hooks.permissionEvaluate(event)
+      expect(event.effect).toBe("deny")
+      expect(event.message).toContain("Crucible guard")
     } finally {
       await hooks.dispose?.()
       await fs.rm(dir, { recursive: true, force: true })
@@ -1233,9 +1392,9 @@ test("shell policy: child sessions get policy rules; destructive is denied", asy
   }
 })
 
-const asked = (sessionID: string) => ({ type: "permission.asked", properties: { id: "per_1", sessionID, permission: "external_directory", patterns: ["/etc/*"] } })
+const asked = (sessionID: string) => ({ type: "permission.asked", data: { id: "per_1", sessionID, action: "external_directory", resources: ["/etc/*"] } })
 
-test("permission.asked: guarded rejects for dispatched sessions only", async () => {
+test("permission.asked: guarded rejects for dispatched sessions only, with feedback", async () => {
   const { dir, client, hooks, call, emit } = await harness()
   try {
     await readyRun(call, "pa")
@@ -1245,8 +1404,11 @@ test("permission.asked: guarded rejects for dispatched sessions only", async () 
     expect(client.rejects.length).toBe(0)
     await emit(asked(child))
     expect(client.rejects.length).toBe(1)
-    expect(client.rejects[0].path).toEqual({ id: child, permissionID: "per_1" })
-    expect(client.rejects[0].body).toEqual({ response: "reject" })
+    expect(client.rejects[0].sessionID).toBe(child)
+    expect(client.rejects[0].requestID).toBe("per_1")
+    expect(client.rejects[0].decision).toBe("reject")
+    // A rejection with feedback lets the agent continue its turn.
+    expect(client.rejects[0].message).toContain("Refused automatically")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1264,7 +1426,7 @@ test("permission.asked under ask: no reject, watchdog paused until replied", asy
     await sleep(300)
     expect(client.aborts.length).toBe(0)
     expect(client.prompts.length).toBe(1)
-    await emit({ type: "permission.replied", properties: { sessionID: child, requestID: "per_1", reply: "once" } })
+    await emit({ type: "permission.replied", data: { sessionID: child, requestID: "per_1", reply: "once" } })
     await sleep(300)
     expect(client.aborts.length).toBeGreaterThanOrEqual(1)
   } finally {
@@ -1280,20 +1442,20 @@ test("policy change updates a reused role session once", async () => {
     await call("design_dispatch", { slug: "pc" })
     const architect = (await readState(dir, "pc")).dispatch.child_session_id
     await callAs(architect)("design_respond", { response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
-    await emit({ type: "session.idle", properties: { sessionID: architect } })
-    const permUpdates = () => client.updates.filter((u: any) => u.body?.permission)
+    await emit({ type: "session.idle", data: { sessionID: architect } })
+    const permUpdates = () => client.updates.filter((u: any) => u.permissions)
     expect(permUpdates().length).toBe(0)
     await call("design_config", { slug: "pc", shell_policy: "allow" })
     const falsifier = (await readState(dir, "pc")).dispatch.child_session_id
     await callAs(falsifier)("design_submit_verdict", { slug: "pc", verdict_json: findingsVerdict(1, ["F-1"]) })
-    await emit({ type: "session.idle", properties: { sessionID: falsifier } })
+    await emit({ type: "session.idle", data: { sessionID: falsifier } })
     // The falsifier session was created under "allow"; the architect is reused with the stale policy.
     await call("design_respond", { slug: "pc", response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [] }) }).catch(() => {})
     const st = await readState(dir, "pc")
     expect(st.dispatch?.child_session_id ?? architect).toBeTruthy()
-    const ups = permUpdates().filter((u: any) => u.path.id === architect)
+    const ups = permUpdates().filter((u: any) => u.sessionID === architect)
     expect(ups.length).toBe(1)
-    expect(hasRule(ups[0].body.permission, "external_directory", "*", "allow")).toBe(true)
+    expect(hasRule(ups[0].permissions, "external_directory", "*", "allow")).toBe(true)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1311,7 +1473,7 @@ test("dispatched agents are held to their role's tools and files", async () => {
     await expect(asArchitect("design_submit_verdict", { slug: "role", verdict_json: cleanVerdict(1, fullCov) })).rejects.toThrow(/falsifier only/)
     await expect(asArchitect("design_stop", {})).rejects.toThrow(/Referee only/)
     expect(j(await asArchitect("design_respond", { response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })).ok).toBe(true)
-    await emit({ type: "session.idle", properties: { sessionID: architect } })
+    await emit({ type: "session.idle", data: { sessionID: architect } })
     const falsifier = (await readState(dir, "role")).dispatch.child_session_id
     expect(falsifier).not.toBe(architect)
     const asFalsifier = callAs(falsifier)
@@ -1319,25 +1481,34 @@ test("dispatched agents are held to their role's tools and files", async () => {
     await expect(asFalsifier("design_decide", { finding_id: "F-1", decision: "resolved" })).rejects.toThrow(/Referee only/)
     await expect(asFalsifier("design_start", { system: "x", brief: "b" })).rejects.toThrow(/Referee only/)
 
-    const write = (sessionID: string, filePath: string, tool = "write") => hooks["tool.execute.before"]({ tool, sessionID, callID: "c" }, { args: { filePath, content: "x" } })
-    await expect(write(falsifier, "docs/design/role/03-architecture.md")).rejects.toThrow(/Falsifier never edits/)
-    await write(falsifier, "docs/design/role/07-review-log.md")
-    await expect(write(architect, "docs/design/role/07-review-log.md", "edit")).rejects.toThrow(/owned by the Falsifier/)
-    await expect(write(architect, "docs/design/role/.crucible/state.json")).rejects.toThrow(/\.crucible/)
-    await expect(write(architect, "docs/design/other-run/03-architecture.md")).rejects.toThrow(/own run directory/)
-    await write(architect, "docs/design/role/03-architecture.md")
-    await expect(write(architect, "src/app.ts")).rejects.toThrow(/own run directory/)
-    await expect(write(falsifier, "README.md")).rejects.toThrow(/own run directory/)
-    await write(architect, "/tmp/opencode/scratch.py")
-    await expect(
-      hooks["tool.execute.before"]({ tool: "apply_patch", sessionID: falsifier, callID: "c" }, { args: { patchText: "*** Begin Patch\n*** Update File: docs/design/role/05-risks.md\n@@\n-a\n+b\n*** End Patch" } }),
-    ).rejects.toThrow(/Falsifier never edits/)
-    const bash = (sessionID: string, command: string) => hooks["tool.execute.before"]({ tool: "bash", sessionID, callID: "c" }, { args: { command } })
-    await expect(bash(falsifier, "git commit -m x")).rejects.toThrow(/repository-changing/)
-    await bash(falsifier, "git status")
+    // File guards run in the V2 permission hook: an edit is denied with a reason.
+    const edit = async (sessionID: string, ...files: string[]) => {
+      const event: any = { action: "edit", sessionID, resources: files.map((f) => path.resolve(dir, f)), effect: "allow" }
+      await hooks.permissionEvaluate(event)
+      return event
+    }
+    expect((await edit(falsifier, "docs/design/role/03-architecture.md")).message).toMatch(/Falsifier never edits/)
+    expect((await edit(falsifier, "docs/design/role/07-review-log.md")).effect).toBe("allow")
+    expect((await edit(architect, "docs/design/role/07-review-log.md")).message).toMatch(/owned by the Falsifier/)
+    expect((await edit(architect, "docs/design/role/.crucible/state.json")).message).toMatch(/\.crucible/)
+    expect((await edit(architect, "docs/design/other-run/03-architecture.md")).message).toMatch(/own run directory/)
+    expect((await edit(architect, "docs/design/role/03-architecture.md")).effect).toBe("allow")
+    expect((await edit(architect, "src/app.ts")).message).toMatch(/own run directory/)
+    expect((await edit(falsifier, "README.md")).message).toMatch(/own run directory/)
+    expect((await edit(architect, "/tmp/opencode/scratch.py")).effect).toBe("allow")
+    // A patch touching a protected file is denied; the check is per resource.
+    expect((await edit(falsifier, "docs/design/role/05-risks.md")).message).toMatch(/Falsifier never edits/)
+    const shell = async (sessionID: string, command: string) => {
+      const event: any = { action: "shell", sessionID, resources: [command], effect: "allow" }
+      await hooks.permissionEvaluate(event)
+      return event
+    }
+    expect((await shell(falsifier, "git commit -m x")).message).toMatch(/repository-changing/)
+    expect((await shell(falsifier, "git status")).effect).toBe("allow")
     // The user's own session is never restricted.
-    await hooks["tool.execute.before"]({ tool: "write", sessionID: "ses_user", callID: "c" }, { args: { filePath: "docs/design/role/.crucible/state.json" } })
-    await write("ses_user", "src/app.ts")
+    expect((await edit("ses_user", "docs/design/role/.crucible/state.json")).effect).toBe("allow")
+    expect((await edit("ses_user", "src/app.ts")).effect).toBe("allow")
+    expect((await shell("ses_user", "git commit -m x")).effect).toBe("allow")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1514,7 +1685,7 @@ test("a deleted child session is replaced at once", async () => {
     await readyRun(call, "del")
     await call("design_dispatch", { slug: "del" })
     const child = (await readState(dir, "del")).dispatch.child_session_id
-    await emit({ type: "session.deleted", properties: { info: { id: child } } })
+    await emit({ type: "session.deleted", data: { sessionID: child } })
     const st = await readState(dir, "del")
     expect(st.dispatch.child_session_id).not.toBe(child)
     expect(st.dispatch.retries).toBe(1)
@@ -1569,7 +1740,7 @@ test("a weak rebuttal keeps gating and is put to the user; reopen re-runs the la
     expect(f1.contested).toBe(true)
     expect(st.history[0].gate).toBe(1)
     expect(st.escalations.some((e: any) => e.requirement_id === "F-1")).toBe(true)
-    expect(client.prompts.some((p: any) => p.path.id === ctx.sessionID && promptText(p).includes("F-1"))).toBe(true)
+    expect(client.prompts.some((p: any) => p.sessionID === ctx.sessionID && promptText(p).includes("F-1"))).toBe(true)
     // Reopening a noise finding re-runs the ladder (it stays noise).
     await call("design_decide", { slug: "weak", finding_id: "F-2", decision: "resolved" })
     const reopened = j(await call("design_decide", { slug: "weak", finding_id: "F-2", decision: "reopen" }))
@@ -1608,7 +1779,7 @@ test("a live turn's activity is persisted for the TUI", async () => {
     await call("design_dispatch", { slug: "hb" })
     const child = (await readState(dir, "hb")).dispatch.child_session_id
     await sleep(20)
-    await emit({ type: "message.part.updated", properties: { part: { sessionID: child } } })
+    await emit({ type: "session.text.delta", data: { sessionID: child, delta: "x" } })
     await sleep(50)
     expect((await readState(dir, "hb")).dispatch.last_activity_at).toBeTruthy()
   } finally {
@@ -1672,12 +1843,19 @@ test("dispatched executable evidence must come from a bash run the agent made", 
     await call("design_dispatch", { slug: "cap" })
     const architect = (await readState(dir, "cap")).dispatch.child_session_id
     await callAs(architect)("design_respond", { response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
-    await emit({ type: "session.idle", properties: { sessionID: architect } })
+    await emit({ type: "session.idle", data: { sessionID: architect } })
     const falsifier = (await readState(dir, "cap")).dispatch.child_session_id
     const asFalsifier = callAs(falsifier)
     const lie = { slug: "cap", class: "executable", command: "echo hi", output: "LIES", exit_code: 7 }
     expect(j(await asFalsifier("design_record_evidence", lie)).ok).toBe(false)
-    await hooks["tool.execute.after"]({ tool: "bash", sessionID: falsifier, callID: "c", args: { command: "echo hi" } }, { title: "", output: "hi\n", metadata: { exit: 0 } })
+    await hooks.toolAfter({
+      tool: "shell",
+      sessionID: falsifier,
+      id: "c",
+      input: { command: "echo hi" },
+      status: "completed",
+      result: { output: { output: "hi\n", exit: 0, truncated: false }, content: [{ type: "text", text: "hi\n" }], metadata: { exit: 0 } },
+    })
     const res = j(await asFalsifier("design_record_evidence", lie))
     expect(res.ok).toBe(true)
     expect(res.captured).toBe(true)
@@ -1785,7 +1963,7 @@ test("a Falsifier-requested finding is escalated at verdict time, stays held aft
     let st = await readState(dir, "ask")
     expect(st.phase).toBe("responding")
     expect(st.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
-    expect((client.prompts as any[]).some((p) => p?.path?.id === ctx.sessionID && promptText(p).includes("F-001"))).toBe(true)
+    expect((client.prompts as any[]).some((p) => p?.sessionID === ctx.sessionID && promptText(p).includes("F-001"))).toBe(true)
     await call("design_respond", { slug: "ask", response_json: JSON.stringify({ round: 1, responses: [{ finding_id: "F-001", disposition: "fix" }] }) })
     st = await readState(dir, "ask")
     expect(st.open_findings.find((f: any) => f.id === "F-001")).toMatchObject({ status: "needs_adjudication", contested: true })
@@ -1893,19 +2071,24 @@ test("design_amend_requirement is allowed mid-round (responding) but not on a te
   }
 })
 
-test("shell.env marks dispatched sessions only", async () => {
+test("the shell rewrite marks dispatched sessions only and carries the scratch dir", async () => {
   const { dir, hooks, call } = await harness()
   try {
     await readyRun(call, "env")
     await call("design_dispatch", { slug: "env" })
     const child = (await readState(dir, "env")).dispatch.child_session_id
-    const env = async (sessionID: string) => {
-      const output = { env: {} as Record<string, string> }
-      await hooks["shell.env"]({ cwd: dir, sessionID, callID: "c" }, output)
-      return output.env
+    const run = async (sessionID: string, command: string) => {
+      const input: any = { command }
+      await hooks.toolBefore({ tool: "shell", sessionID, id: "c", input })
+      return input.command as string
     }
-    expect(await env(child)).toEqual({ CRUCIBLE_SESSION: child, CRUCIBLE_WORKTREE: dir, CRUCIBLE_SCRATCH: path.join(os.tmpdir(), "opencode", "crucible", "env") })
-    expect(await env("ses_user")).toEqual({})
+    const marked = await run(child, "echo hi")
+    expect(marked).toContain(`export CRUCIBLE_SESSION='${child}' CRUCIBLE_WORKTREE='${dir}' CRUCIBLE_SCRATCH=`)
+    expect(marked.endsWith("echo hi")).toBe(true)
+    const scratch = /CRUCIBLE_SCRATCH='([^']*)'/.exec(marked)?.[1]
+    expect(scratch?.endsWith(path.join("crucible", "env"))).toBe(true)
+    expect((await fs.stat(scratch!)).isDirectory()).toBe(true)
+    expect(await run("ses_user", "echo hi")).toBe("echo hi")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1922,8 +2105,8 @@ test.skipIf(process.platform !== "linux")("a finished turn kills processes marke
     const marked = Bun.spawn(["sleep", "300"], { env: { ...process.env, CRUCIBLE_SESSION: child } })
     const other = Bun.spawn(["sleep", "300"])
     sleeps.push(marked, other)
-    await emit({ type: "session.status", properties: { sessionID: child, status: { type: "busy" } } })
-    await emit({ type: "session.idle", properties: { sessionID: child } })
+    await emit({ type: "session.status", data: { sessionID: child, status: { type: "busy" } } })
+    await emit({ type: "session.idle", data: { sessionID: child } })
     const timeout = new Promise((r) => setTimeout(() => r("alive"), 3000))
     expect(await Promise.race([marked.exited, timeout])).not.toBe("alive")
     expect(() => process.kill(other.pid, 0)).not.toThrow()
@@ -1934,62 +2117,30 @@ test.skipIf(process.platform !== "linux")("a finished turn kills processes marke
   }
 })
 
-test("permission.asked under guarded: rejected with feedback through the server so the agent continues", async () => {
-  const replies: any[] = []
-  const api = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      replies.push({ path: new URL(req.url).pathname, body: await req.json() })
-      return Response.json(true)
-    },
-  })
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "crucible-work-"))
-  const client = makeClient()
-  const hooks: any = await server({ client, directory: dir, serverUrl: new URL(`http://127.0.0.1:${api.port}`) }, {})
-  const ctx = { sessionID: "ses_referee", directory: dir, messageID: "m", agent: "crucible", worktree: dir }
-  const call = (name: string, args: any) => hooks.tool[name].execute(args, ctx)
-  try {
-    await readyRun(call, "fb")
-    await call("design_dispatch", { slug: "fb" })
-    const child = (await readState(dir, "fb")).dispatch.child_session_id
-    await hooks.event({ event: asked(child) })
-    await drainEvents()
-    expect(replies.length).toBe(1)
-    expect(replies[0].path).toBe("/permission/per_1/reply")
-    expect(replies[0].body.reply).toBe("reject")
-    expect(replies[0].body.message).toContain("Refused automatically")
-    // The bare SDK rejection (which would end the agent's turn) is only a fallback.
-    expect(client.rejects.length).toBe(0)
-  } finally {
-    api.stop(true)
-    await hooks.dispose?.()
-    await fs.rm(dir, { recursive: true, force: true })
-  }
-})
-
-test("dispatched bash docker/podman runs are labelled; scratch dir is per run", async () => {
+test("dispatched shell docker/podman runs are labelled; scratch dir is per run", async () => {
   const { dir, client, hooks, call } = await harness()
   try {
     await readyRun(call, "sc")
     await call("design_dispatch", { slug: "sc" })
     const child = (await readState(dir, "sc")).dispatch.child_session_id
     const run = async (sessionID: string, command: string) => {
-      const output = { args: { command } }
-      await hooks["tool.execute.before"]({ tool: "bash", sessionID, callID: "c" }, output)
-      return output.args.command
+      const input: any = { command }
+      await hooks.toolBefore({ tool: "shell", sessionID, id: "c", input })
+      return input.command as string
     }
     const a = await run(child, "docker run --rm -d postgres:16")
     expect(a).toContain(`docker run --label crucible.session=${child} --label crucible.worktree='${dir}' --rm`)
     expect(await run(child, "podman container run alpine")).toContain(`--label crucible.session=${child}`)
     expect(await run("ses_user", "docker run alpine")).toBe("docker run alpine")
-    expect(await run(child, "echo docker running")).toBe("echo docker running")
+    const plain = await run(child, "echo docker running")
+    expect(plain).toContain("echo docker running")
+    expect(plain).not.toContain("--label")
 
-    const env: any = { env: {} }
-    await hooks["shell.env"]({ sessionID: child }, env)
-    expect(env.env.CRUCIBLE_SCRATCH.endsWith("/crucible/sc")).toBe(true)
-    expect((await fs.stat(env.env.CRUCIBLE_SCRATCH)).isDirectory()).toBe(true)
+    const scratch = /CRUCIBLE_SCRATCH='([^']*)'/.exec(plain)?.[1]
+    expect(scratch?.endsWith("/crucible/sc")).toBe(true)
+    expect((await fs.stat(scratch!)).isDirectory()).toBe(true)
     const last = client.prompts[client.prompts.length - 1]
-    expect(promptText(last)).toContain(env.env.CRUCIBLE_SCRATCH)
+    expect(promptText(last)).toContain(scratch)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })

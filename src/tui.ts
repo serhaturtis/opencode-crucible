@@ -1,4 +1,4 @@
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { Plugin } from "@opencode/plugin/tui"
 import { createElement, insert, setProp } from "@opentui/solid"
 import { createSignal, onCleanup } from "solid-js"
 import { readFileSync, readdirSync, statSync } from "node:fs"
@@ -188,9 +188,9 @@ function summary(run: Run, frame: string) {
   }
 }
 
-function Sidebar(api: TuiPluginApi, sessionID: string) {
-  const theme = api.theme.current
-  const directory = api.state?.path?.directory || api.state?.path?.worktree || process.cwd()
+function Sidebar(context: any, sessionID: string) {
+  const theme = context.theme
+  const directory = context.location?.directory || process.cwd()
 
   // File reads happen on the slow poll; the spinner runs off its own fast tick.
   const refresh = () => {
@@ -233,10 +233,10 @@ function Sidebar(api: TuiPluginApi, sessionID: string) {
   })
   const frame = () => SPINNER[spin() % SPINNER.length]
 
-  const children: Child[] = [text({ fg: theme.text }, ["Crucible"])]
+  const children: Child[] = [text({ fg: theme.text.base }, ["Crucible"])]
   for (let i = 0; i < 6; i++) {
     children.push(
-      text({ fg: theme.textMuted }, [
+      text({ fg: theme.text.muted }, [
         () => {
           const d = data()
           const r = d.all[i]
@@ -249,7 +249,7 @@ function Sidebar(api: TuiPluginApi, sessionID: string) {
       ]),
     )
     children.push(
-      text({ fg: theme.textMuted }, [
+      text({ fg: theme.text.muted }, [
         () => {
           const d = data()
           const r = d.all[i]
@@ -262,22 +262,51 @@ function Sidebar(api: TuiPluginApi, sessionID: string) {
   return box({ flexDirection: "column" }, children)
 }
 
-const tui: TuiPlugin = async (api) => {
-  try {
-    api.slots.register({
-      order: 130,
-      slots: {
-        sidebar_content(_ctx: any, props: any) {
-          return Sidebar(api, props.session_id)
-        },
-      },
-    })
-  } catch {
-    // sidebar is best-effort; never break the TUI
+// Every server notice for this worktree becomes a toast. V2 has no server-side toast API,
+// so the server appends notices to a JSONL file and this tails it.
+function watchNotifications(context: any) {
+  const file = join(dataDir(), "notifications.jsonl")
+  const directory = context.location?.directory
+  let seen = -1
+  const tick = () => {
+    try {
+      const lines = readFileSync(file, "utf8").split("\n").filter(Boolean)
+      // First look (or a rotated file) establishes the baseline without replaying history.
+      if (seen < 0 || seen > lines.length) seen = lines.length
+      for (; seen < lines.length; seen++) {
+        const notice = JSON.parse(lines[seen])
+        if (directory && notice?.dir && notice.dir !== directory) continue
+        context.ui.toast.show({ title: "Crucible", message: String(notice?.message || ""), variant: notice?.variant || "info", duration: 6000 })
+      }
+    } catch {
+      // no notice file yet
+    }
   }
+  const timer = setInterval(tick, 2000)
+  tick()
+  return () => clearInterval(timer)
 }
 
-const plugin: TuiPluginModule = { id: "opencode-crucible.tui", tui }
+const plugin = {
+  id: "opencode-crucible.tui",
+  setup(context: Plugin.Context) {
+    const disposers: Array<() => void> = []
+    try {
+      disposers.push(context.ui.slot({ append: "sidebar.content", render: ({ sessionID }) => Sidebar(context, sessionID) }))
+    } catch {
+      // sidebar is best-effort; never break the TUI
+    }
+    const stopNotices = watchNotifications(context)
+    return () => {
+      for (const dispose of disposers) {
+        try {
+          dispose()
+        } catch {
+        }
+      }
+      stopNotices()
+    }
+  },
+}
 
-export { tui }
 export default plugin

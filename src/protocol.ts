@@ -25,7 +25,7 @@ directly.
 
 The plugin keeps **one long-lived child session per role per run** (an
 Architect session and a separate Falsifier session), created on the role's first
-dispatch and reused for every later round via \`promptAsync\`. The Architect
+dispatch and reused for every later round via a session prompt. The Architect
 session retains the design it wrote and the Falsifier session retains its prior
 reviews, so they do not re-orient or re-read the workspace each round; the two
 roles stay separate, so the Falsifier never sees the Architect's rationale.
@@ -194,7 +194,7 @@ exit_code) before citing it, and put the returned id in the finding as
 \`evidence.artifact_id\`. An \`executable\` or \`model_checked\` finding without a
 recorded artifact is **downgraded to \`hypothesis\`** and will not gate
 convergence. Evidence recorded by a dispatched agent is taken from a bash
-command that agent actually ran in the current turn: run it with the bash tool,
+command that agent actually ran in the current turn: run it with the shell tool,
 then call \`design_record_evidence\` with the same \`command\`; the plugin records
 the captured output and exit code and ignores typed-in ones. Evidence recorded by
 the Referee or user is taken as given. Only \`verified\` strong-class evidence is binding; \`supported\` is

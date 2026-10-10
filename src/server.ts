@@ -1,4 +1,5 @@
-import { tool } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin"
+import { z } from "zod"
 import * as fs from "node:fs/promises"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import * as path from "node:path"
@@ -59,8 +60,6 @@ import {
 import { PROTOCOL } from "./protocol"
 import { enqueueEvent } from "./events"
 
-const z = tool.schema
-
 // Crucible plugin: persistence, scheduler, tools, injected agents (pure logic in ./core).
 
 // A dispatched turn is killed only after this much silence (no token, tool call, or status event).
@@ -73,19 +72,34 @@ const BUSY_GRACE_MS = 5000
 const HEARTBEAT_PERSIST_MS = 60 * 1000
 // Bus events that prove a dispatched child session is still alive.
 const WATCHDOG_ACTIVITY_EVENTS = new Set([
-  "message.updated",
-  "message.part.updated",
   "session.status",
+  "session.retry.scheduled",
   "session.compacted",
+  "session.text.delta",
+  "session.text.ended",
+  "session.reasoning.delta",
+  "session.step.started",
+  "session.step.ended",
+  "session.step.failed",
+  "session.tool.input.started",
+  "session.tool.input.delta",
+  "session.tool.input.ended",
+  "session.tool.progress",
+  "session.tool.success",
+  "session.tool.failed",
   "permission.replied",
 ])
 const SHELL_POLICIES = new Set(["guarded", "allow", "ask"])
 
-// The SDK client and plugin options are shared across opencode instances; calls pass their run's directory explicitly.
-let CLIENT: any = null
+// The plugin context (the host's per-location API) and options are keyed by worktree: one
+// process can host several locations, each with its own plugin instance.
+const CONTEXTS = new Map<string, any>()
 let OPTIONS: any = {}
-// The server's own URL, for API routes the SDK client lacks.
-let SERVER_URL: URL | null = null
+
+// The V2 plugin context for a worktree (set when that worktree's plugin instance loads).
+function api(dir: string) {
+  return CONTEXTS.get(path.resolve(dir))
+}
 
 // child session id -> the last time it showed activity, plus where its run lives.
 const watchdogs = new Map<string, { last: number; persisted: number; dir: string; slug: string; timeout: number; tools: Set<string>; waiting: boolean }>()
@@ -124,15 +138,9 @@ function effectiveShellPolicy(state: any) {
   return SHELL_POLICIES.has(OPTIONS.shellPolicy) ? OPTIONS.shellPolicy : "guarded"
 }
 
-// The session an event belongs to (shapes vary: part/info/sessionID).
+// The session an event belongs to (V2 payloads carry `data.sessionID`).
 function eventSessionID(event: any): string | null {
-  const p = event?.properties
-  return p?.sessionID || p?.part?.sessionID || p?.info?.sessionID || null
-}
-
-// A readable message from an SDK error payload (`{ error }` results).
-function errorText(error: any) {
-  return String(error?.data?.message || error?.message || error?.name || JSON.stringify(error))
+  return event?.data?.sessionID || event?.properties?.sessionID || null
 }
 
 // Serialize all state mutations for a run so the scheduler and tools cannot interleave a read-modify-write.
@@ -154,15 +162,17 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-function injectAgent(cfg: any, name: string, defaults: any) {
-  cfg.agent = cfg.agent || {}
-  const existing = { ...(cfg.agent[name] || {}) }
-  const merged: any = { ...defaults, ...existing }
-  merged.prompt = defaults.prompt
-  merged.mode = defaults.mode
-  merged.description = existing.description || defaults.description
-  for (const key of Object.keys(merged)) if (merged[key] === undefined) delete merged[key]
-  cfg.agent[name] = merged
+// Inject (or refresh) an agent through the V2 agent editor: the plugin owns the agent's
+// system prompt and mode; a user's own configuration keeps the rest.
+function injectAgent(editor: any, id: string, defaults: { name: string; description: string; model?: any; system: string }) {
+  const existing = editor.get(id)
+  editor.update(id, (agent: any) => {
+    if (!existing) agent.name = defaults.name
+    agent.mode = "subagent"
+    agent.system = defaults.system
+    if (!agent.description) agent.description = defaults.description
+    if (defaults.model && !agent.model) agent.model = defaults.model
+  })
 }
 
 // --- persistence -----------------------------------------------------------
@@ -174,6 +184,12 @@ function dataDir() {
 
 function registryFile() {
   return path.join(dataDir(), "sessions.json")
+}
+
+// User-facing notices are appended here; the TUI plugin tails the file and shows them as
+// toasts (V2 has no server-side toast API).
+function notificationsFile() {
+  return path.join(dataDir(), "notifications.jsonl")
 }
 
 // Candidate docs/design roots for a worktree (canonical plus an immediate subdirectory's), sorted.
@@ -499,8 +515,25 @@ async function lockForRun(dir: string, slug: string) {
 }
 
 // The run and role of a dispatched child session, or null for any other session.
-// Recent bash runs per dispatched session, so executable evidence is what the agent really ran, not what it typed.
+// Recent shell runs per dispatched session, so executable evidence is what the agent really ran, not what it typed.
 const shellRuns = new Map<string, Array<{ command: string; output: string; exit: number | null; at: number }>>()
+// The command the agent wrote for a shell call, before the plugin's rewrites (labels, marker env).
+const shellOriginals = new Map<string, string>()
+const shellKey = (sessionID: string, callID: string) => `${sessionID}\u0000${callID}`
+
+// Extract the text output and exit code from a V2 shell tool result.
+function shellResult(result: any): { output: string; exit: number | null } {
+  const exitOf = (value: any) => (typeof value?.exit === "number" ? value.exit : null)
+  const out = result?.output
+  if (typeof out === "string") return { output: out, exit: exitOf(result?.metadata) }
+  if (out && typeof out === "object") return { output: String(out.output ?? ""), exit: exitOf(out) ?? exitOf(result?.metadata) }
+  const content = Array.isArray(result?.content)
+    ? result.content.map((part: any) => (typeof part === "string" ? part : part?.text || "")).join("\n")
+    : typeof result?.content === "string"
+      ? result.content
+      : ""
+  return { output: content, exit: exitOf(result?.metadata) }
+}
 
 async function callerRun(dir: string, sessionID: string | undefined) {
   if (!sessionID) return null
@@ -837,13 +870,13 @@ async function ingestDecomposition(dir: string, slug: string, state: any, manife
 
 // Wake the Referee session to put the proceed/cancel question to the user.
 async function promptReferee(dir: string, sessionId: string | null | undefined, text: string) {
-  if (!CLIENT?.session?.promptAsync || !sessionId) return
+  const client = api(dir)
+  if (!client?.session?.prompt || !sessionId) return
   try {
-    // The Referee runs as the built-in build agent (only built-in primaries get the question tool).
-    await CLIENT.session.promptAsync({
-      path: { id: sessionId },
-      body: { agent: "build", parts: [{ type: "text", text: `You are acting as the Crucible Referee. ${text}` }] },
-      query: { directory: dir },
+    await ensureRefereeAgent(client, sessionId)
+    await client.session.prompt({
+      sessionID: sessionId,
+      text: `You are acting as the Crucible Referee. ${text}`,
     })
   } catch {
   }
@@ -935,23 +968,23 @@ function resetProgressCounters(state: any) {
 // --- UX --------------------------------------------------------------------
 
 async function refreshTitle(dir: string, state: any) {
-  if (!CLIENT || !state?.session_id) return
+  const client = api(dir)
+  if (!client || !state?.session_id) return
   try {
     const last = state.history?.[state.history.length - 1]
     const badge = last ? ` score=${last.score}` : ""
-    await CLIENT.session.update({
-      path: { id: state.session_id },
-      body: { title: `Crucible: ${state.system} [r${state.round} ${state.phase}${badge}]` },
-      query: { directory: dir },
+    await client.session.update({
+      sessionID: state.session_id,
+      title: `Crucible: ${state.system} [r${state.round} ${state.phase}${badge}]`,
     })
   } catch {
   }
 }
 
+// User-facing notice; the TUI plugin tails the file and shows a toast.
 async function notify(dir: string, message: string, variant: string) {
-  if (!CLIENT?.tui?.showToast) return
   try {
-    await CLIENT.tui.showToast({ body: { message, variant, duration: 6000 }, query: { directory: dir } })
+    await fs.appendFile(notificationsFile(), JSON.stringify({ at: nowIso(), dir, message, variant }) + "\n")
   } catch {
   }
 }
@@ -1096,12 +1129,13 @@ async function persistHeartbeat(dir: string, slug: string, childID: string) {
   }
 }
 
-// Running tool calls per dispatched child, from part updates.
-function noteTool(childID: string, part: any) {
+// Running tool calls per dispatched child, from the V2 tool lifecycle events.
+function noteTool(childID: string, event: any) {
   const w = watchdogs.get(childID)
-  if (!w || part?.type !== "tool" || !part.callID) return
-  if (part.state?.status === "pending" || part.state?.status === "running") w.tools.add(part.callID)
-  else w.tools.delete(part.callID)
+  const id = event?.data?.id
+  if (!w || !id) return
+  if (event.type === "session.tool.input.started" || event.type === "session.tool.called") w.tools.add(String(id))
+  else if (event.type === "session.tool.success" || event.type === "session.tool.failed") w.tools.delete(String(id))
 }
 
 function clearWatchdog(childID: string) {
@@ -1201,7 +1235,7 @@ async function abortSession(dir: string, id: string) {
   clearWatchdog(id)
   killMarked(`CRUCIBLE_SESSION=${id}`)
   try {
-    await CLIENT?.session?.abort?.({ path: { id }, query: { directory: dir } })
+    await api(dir)?.session?.interrupt?.({ sessionID: id })
   } catch {
   }
 }
@@ -1263,20 +1297,23 @@ function isInheritModel(ref: any) {
 }
 
 async function dispatchRole(dir: string, state: any, role: string, retries = 0) {
+  const client = api(dir)
+  const model = parseModelRef(state.models?.[role])
+  const modelRef = model ? { providerID: model.providerID, id: model.modelID } : undefined
   // One long-lived child session per role per run, kept separate to preserve independence.
   state.sessions = state.sessions || {}
   let childID: string | undefined = state.sessions[role]
   const first = !childID
   if (!childID) {
     const parentID = await refereeSessionId(dir, state)
-    const created = await CLIENT.session.create({
-      body: { ...(parentID ? { parentID } : {}), title: `crucible:${state.slug}:${role}`, permission: sessionPermissions(effectiveShellPolicy(state)) },
-      query: { directory: dir },
+    const created = await client.session.create({
+      ...(parentID ? { parentID } : {}),
+      title: `crucible:${state.slug}:${role}`,
+      agent: role,
+      ...(modelRef ? { model: modelRef } : {}),
+      permissions: sessionPermissions(effectiveShellPolicy(state)),
     })
-    // The SDK reports HTTP failures in the result instead of throwing.
-    if (created?.error) throw new Error(`Failed to create child session: ${errorText(created.error)}`)
-    const child = created?.data ?? created
-    childID = child?.id
+    childID = created?.id
     if (!childID) throw new Error("Failed to create child session for dispatch.")
     state.sessions[role] = childID
     await bindSession(dir, childID, state.slug)
@@ -1288,8 +1325,15 @@ async function dispatchRole(dir: string, state: any, role: string, retries = 0) 
   const policy = effectiveShellPolicy(state)
   if (state.session_policy?.[role] !== policy) {
     try {
-      await CLIENT.session.update({ path: { id: childID }, body: { permission: sessionPermissions(policy) }, query: { directory: dir } })
+      await client.session.update({ sessionID: childID, permissions: sessionPermissions(policy) })
       state.session_policy = { ...(state.session_policy || {}), [role]: policy }
+    } catch {
+    }
+  }
+  // A reused session gets the run's current model override (a no-op when unchanged).
+  if (modelRef) {
+    try {
+      await client.session.switchModel({ sessionID: childID, model: modelRef })
     } catch {
     }
   }
@@ -1311,17 +1355,10 @@ async function dispatchRole(dir: string, state: any, role: string, retries = 0) 
   armWatchdog(dir, state.slug, childID as string, effectiveWatchdogMs(state))
   await refreshTitle(dir, state)
   try {
-    const model = parseModelRef(state.models?.[role])
-    const res = await CLIENT.session.promptAsync({
-      path: { id: childID },
-      body: {
-        agent: role,
-        ...(model ? { model } : {}),
-        parts: [{ type: "text", text: dispatchPrompt(state, role, first, { designDir: relDesignDir(dir, state.slug), retry: retries > 0, stalled }) }],
-      },
-      query: { directory: dir },
+    await client.session.prompt({
+      sessionID: childID,
+      text: dispatchPrompt(state, role, first, { designDir: relDesignDir(dir, state.slug), retry: retries > 0, stalled }),
     })
-    if (res?.error) throw new Error(`promptAsync failed: ${errorText(res.error)}`)
   } catch (error) {
     // The reused session may be gone; drop it so the retry recreates it.
     delete state.sessions[role]
@@ -1494,15 +1531,13 @@ async function onIdle(dir: string, childID: string) {
 }
 
 async function onSessionError(dir: string, childID: string, error: any) {
-  // Aborts (watchdog retry, pause, stop, or the user's) are not a failure of the turn.
-  if (error?.name === "MessageAbortedError") return
   const slug = await resolveSlug(dir, undefined, childID)
   if (!slug) return
   await withLock(await lockForRun(dir, slug), async () => {
     const state = await readState(dir, slug)
     if (!state || !state.dispatch || state.dispatch.child_session_id !== childID) return
     clearWatchdog(childID)
-    await retryOrFail(dir, state, state.dispatch, `session_error${error?.name ? `: ${error.name}` : ""}`)
+    await retryOrFail(dir, state, state.dispatch, `session_error${error?.type ? `: ${error.type}` : ""}`)
   })
 }
 
@@ -1526,19 +1561,14 @@ async function onSessionDeleted(dir: string, sessionID: string) {
   })
 }
 
-// Sessions the server reports as running (busy/retry), or null if it cannot say.
+// Sessions the server reports as running, or null if it cannot say.
 async function busySessions(dir: string): Promise<Set<string> | null> {
-  if (!CLIENT?.session?.status) return null
+  const client = api(dir)
+  if (!client?.session?.active) return null
   try {
-    const res = await CLIENT.session.status({ query: { directory: dir } })
-    if (res?.error) return null
-    const map = res?.data ?? res
+    const map = await client.session.active()
     if (!map || typeof map !== "object") return null
-    return new Set(
-      Object.entries(map)
-        .filter(([, s]: [string, any]) => s && typeof s === "object" && s.type && s.type !== "idle")
-        .map(([id]) => id),
-    )
+    return new Set(Object.keys(map))
   } catch {
     return null
   }
@@ -1635,39 +1665,30 @@ async function recoverRuns(dir: string) {
 
 // --- child-agent guards ----------------------------------------------------
 
-// Paths a file-writing tool call will touch (edit/write/multiedit and patch headers).
-function writtenPaths(toolName: string, args: any): string[] {
-  if (!args || typeof args !== "object") return []
-  if (/todo/.test(toolName) || !/(edit|write|patch)/.test(toolName)) return []
-  const out: string[] = []
-  for (const key of ["filePath", "file_path", "path"]) if (typeof args[key] === "string" && args[key]) out.push(args[key])
-  for (const value of Object.values(args)) {
-    if (typeof value !== "string") continue
-    for (const m of value.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/gm)) out.push(m[1].trim())
-  }
-  return out
-}
-
 // opencode's own temp dir (Global.Path.tmp): the agents' scratch area, allowed for writes and outside-directory access.
 const SCRATCH_DIR = path.join(os.tmpdir(), "opencode")
 const runScratch = (slug: string) => path.join(SCRATCH_DIR, "crucible", slug)
 // Where opencode stores full outputs of truncated tool results, which agents must be able to read.
 const TOOL_OUTPUT_DIR = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "tool-output")
 
+// POSIX shell-quote a value.
+const shq = (value: any) => `'${String(value).replace(/'/g, `'\\''`)}'`
+// V2 permission resources use forward slashes on every platform.
+const slash = (value: string) => value.split(path.sep).join("/")
+
 // Child-session permission rules for a shell policy. Unattended policies never leave an "ask": nobody could answer it.
 function sessionPermissions(policy: string) {
   const prompt = policy === "ask"
   const outside = policy === "allow" ? "allow" : prompt ? "ask" : "deny"
   return [
-    { permission: "bash", pattern: "*", action: prompt ? "ask" : "allow" },
-    { permission: "edit", pattern: "*", action: "allow" },
-    { permission: "external_directory", pattern: "*", action: outside },
-    { permission: "external_directory", pattern: path.join(SCRATCH_DIR, "*"), action: "allow" },
-    { permission: "external_directory", pattern: path.join(TOOL_OUTPUT_DIR, "*"), action: "allow" },
-    { permission: "doom_loop", pattern: "*", action: prompt ? "ask" : "deny" },
-    { permission: "read", pattern: "*.env", action: prompt ? "ask" : "deny" },
-    { permission: "read", pattern: "*.env.*", action: prompt ? "ask" : "deny" },
-    { permission: "read", pattern: "*.env.example", action: "allow" },
+    { action: "shell", resource: "*", effect: prompt ? "ask" : "allow" },
+    { action: "edit", resource: "*", effect: "allow" },
+    { action: "external_directory", resource: "*", effect: outside },
+    { action: "external_directory", resource: slash(path.join(SCRATCH_DIR, "*")), effect: "allow" },
+    { action: "external_directory", resource: slash(path.join(TOOL_OUTPUT_DIR, "*")), effect: "allow" },
+    { action: "read", resource: "*.env", effect: prompt ? "ask" : "deny" },
+    { action: "read", resource: "*.env.*", effect: prompt ? "ask" : "deny" },
+    { action: "read", resource: "*.env.example", effect: "allow" },
   ]
 }
 
@@ -1677,27 +1698,46 @@ async function onPermissionAsked(dir: string, p: any) {
   if (!sid || !p?.id) return
   const caller = await callerRun(dir, sid)
   if (!caller) return
-  const what = `${p.permission} ${[p.patterns].flat().filter(Boolean).join(" ")}`.trim()
+  const what = `${p.action} ${(p.resources || []).filter(Boolean).join(" ")}`.trim()
   if (effectiveShellPolicy(caller.state) === "ask") {
     const w = watchdogs.get(sid)
     if (w) w.waiting = true
     await notify(dir, `Crucible ${caller.slug}: the ${caller.role || "agent"} is waiting for your permission (${what})`, "warning")
     return
   }
-  // A rejection with feedback lets the agent continue its turn; a bare one (the fallback) ends it.
-  const feedback = `Refused automatically: this unattended run allows no ${p.permission} prompts. ${p.permission === "external_directory" ? `Work inside the project or ${SCRATCH_DIR} instead.` : "Take another route."} Continue your task.`
-  const replied = await fetch(new URL(`/permission/${p.id}/reply?directory=${encodeURIComponent(dir)}`, SERVER_URL || "http://invalid"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ reply: "reject", message: feedback }),
-  }).then((r) => r.ok, () => false)
-  if (!replied) {
-    try {
-      await CLIENT?.postSessionIdPermissionsPermissionId?.({ path: { id: sid, permissionID: p.id }, body: { response: "reject" }, query: { directory: dir } })
-    } catch {
-    }
+  // A rejection with feedback lets the agent continue its turn.
+  const feedback = `Refused automatically: this unattended run allows no ${p.action} prompts. ${p.action === "external_directory" ? `Work inside the project or ${SCRATCH_DIR} instead.` : "Take another route."} Continue your task.`
+  try {
+    await api(dir)?.permission?.reply?.({ sessionID: sid, requestID: p.id, decision: "reject", message: feedback })
+  } catch {
   }
   await notify(dir, `Crucible ${caller.slug}: rejected a ${what} prompt for the ${caller.role || "agent"} (unattended run)`, "info")
+}
+
+// The V2 replacement for the V1 `tool.execute.before` guard: a dispatched session's shell/edit
+// actions are re-decided here, where a denial with a message is visible to the model.
+async function onPermissionEvaluate(dir: string, event: any) {
+  const caller = await callerRun(dir, event?.sessionID)
+  if (!caller) return
+  if (event.action === "shell") {
+    if (effectiveShellPolicy(caller.state) === "allow") return // per-run: guard disabled
+    const bad = (event.resources || []).find((cmd: string) => isDestructive(cmd))
+    if (bad) {
+      event.effect = "deny"
+      event.message = "Crucible guard: destructive or repository-changing command blocked (read-only git such as status, log, diff and show is allowed)."
+    }
+    return
+  }
+  if (event.action === "edit") {
+    for (const file of event.resources || []) {
+      const problem = fileGuard(dir, caller, file)
+      if (problem) {
+        event.effect = "deny"
+        event.message = `Crucible guard: ${problem}`
+        return
+      }
+    }
+  }
 }
 
 // Protocol hard rules for files: state only via design_* tools, writes only inside the run dir.
@@ -1718,6 +1758,10 @@ function fileGuard(dir: string, caller: { slug: string; role: string | null }, f
 }
 
 // --- tools -----------------------------------------------------------------
+
+// Tool definitions stay plain `{ description, args, execute }`; the V2 setup registers them
+// through the tool transform (args convert to JSON Schema there).
+const tool = (definition: any) => definition
 
 // Configuration knobs shared by design_start and design_config (chosen per run).
 const CONFIG_ARGS = {
@@ -2053,7 +2097,7 @@ const DESIGN_RECORD_EVIDENCE = tool({
           const run = [...runs].reverse().find((r) => !want || r.command === want)
           if (!run) {
             const recent = runs.slice(-5).map((r) => `- ${r.command}`).join("\n")
-            return JSON.stringify({ ok: false, error: `executable/model_checked evidence must come from a command run with the bash tool in this turn. Run it, then record it with the same command.${recent ? `\nCommands run this turn:\n${recent}` : ""}` }, null, 2)
+            return JSON.stringify({ ok: false, error: `executable/model_checked evidence must come from a command run with the shell tool in this turn. Run it, then record it with the same command.${recent ? `\nCommands run this turn:\n${recent}` : ""}` }, null, 2)
           }
           command = run.command
           output = run.output
@@ -2721,7 +2765,7 @@ const FALSIFIER_PROMPT = `You are the Crucible Falsifier (discriminator) in an a
 A dispatch message gives you a run slug, round, and working directory (the run's design directory). Before acting, call design_protocol (no arguments) to load the protocol.
 Then call design_get_context with { slug, role: "falsifier" }.
 Adversarially search for reasons the design fails: requirement gaps, contradictions, ambiguity, and concrete failure scenarios. Use the shell to ground claims when possible.
-For every executable or model_checked claim, first run the command with the bash tool this turn, then call design_record_evidence (class, same command; the plugin captures the real output and exit code) and put the returned id in the finding's evidence.artifact_id. Findings without a recorded executable/model_checked/authoritative artifact are downgraded and will not gate convergence. Any server or background process you start for evidence (e.g. a database under the run's scratch directory, $CRUCIBLE_SCRATCH) must be stopped before you end your turn (the plugin also kills leftovers at the end of your turn). Containers started with docker or podman run are removed then too; prefer --rm. Use only read-only git (status, log, diff, show); never commit, stage, switch branches or stash, because the user owns the repository.
+For every executable or model_checked claim, first run the command with the shell tool this turn, then call design_record_evidence (class, same command; the plugin captures the real output and exit code) and put the returned id in the finding's evidence.artifact_id. Findings without a recorded executable/model_checked/authoritative artifact are downgraded and will not gate convergence. Any server or background process you start for evidence (e.g. a database under the run's scratch directory, $CRUCIBLE_SCRATCH) must be stopped before you end your turn (the plugin also kills leftovers at the end of your turn). Containers started with docker or podman run are removed then too; prefer --rm. Use only read-only git (status, log, diff, show); never commit, stage, switch branches or stash, because the user owns the repository.
 Every finding needs a unique id (number new findings from next_finding_id in the hand-off; an old id re-raises that finding, and a resolved one needs evidence recorded this round), a severity (blocker | major | minor), a category, a concrete counterexample, a requirement/constraint citation (requirement_ids or constraint_ref), an artifact_ref, and evidence {class, verification}. verification is one of hypothesis | supported | verified | disputed; use verified only when you have a recorded artifact or authoritative citation. action is "open" (default) or "needs_adjudication". Use needs_adjudication to put a question only the user can settle (e.g. a contradiction between requirements): the user is asked at once, and the Architect cannot close it alone. Do not inflate severity. When a gap must be fixed inside a subsystem, set subsystem_ref on the finding.
 Findings must be worth their cost: weigh severity and real risk against the complexity a fix would require, and do not demand disproportionate mechanism. Prioritize requirement gaps and concrete failure/risk over meta or internal-consistency nits, and cap those. It is valid to record a reservation as a minor finding rather than demand a change. If the design is over its spec-size budget, prioritize changes that remove or simplify.
 Never edit the design artifacts or other project files. Write only 07-review-log.md in the working directory (append a short summary and the findings), plus scratch files in the run's scratch directory ($CRUCIBLE_SCRATCH).
@@ -2763,166 +2807,183 @@ Call design_protocol first (it returns the protocol). Then, based on the first w
 // The bus-event work a Crucible run reacts to, as a deferred job (or null).
 function eventJob(dir: string, event: any): (() => Promise<void>) | null {
   const sid = eventSessionID(event)
-  const statusType = event?.properties?.status?.type
+  const statusType = event?.data?.status?.type
   if (event?.type === "session.deleted") {
-    const id = event?.properties?.info?.id
+    const id = event?.data?.sessionID
     return id ? () => onSessionDeleted(dir, id) : null
   }
   if (!sid) return null
   if (event.type === "session.status" && statusType === "busy") return () => onBusy(dir, sid)
-  if (event.type === "session.idle" || (event.type === "session.status" && statusType === "idle")) return () => onIdle(dir, sid)
-  if (event.type === "session.error") return () => onSessionError(dir, sid, event?.properties?.error)
+  if (event.type === "session.idle" || event.type === "session.execution.succeeded" || (event.type === "session.status" && statusType === "idle")) {
+    return () => onIdle(dir, sid)
+  }
+  if (event.type === "session.execution.failed") return () => onSessionError(dir, sid, event?.data?.error)
   return null
 }
 
-export const server = async (input: any, options?: any) => {
-  CLIENT = input?.client
-  OPTIONS = options || {}
-  SERVER_URL = input?.serverUrl ? new URL(String(input.serverUrl)) : null
-  // This instance's worktree, used by hooks (one process may host several instances).
-  const directory = path.resolve(input?.directory || process.cwd())
-  let disposed = false
-  // Child shell defaults: no interactive prompts, destructive commands blocked.
-  const bashPerm = OPTIONS.shellPolicy === "ask" ? "ask" : "allow"
+// The work one received bus event triggers (watchdog liveness, tool tracking, runs).
+async function handleBusEvent(dir: string, event: any) {
+  const sid = eventSessionID(event)
+  // Real work from a dispatched child resets its inactivity window.
+  if (sid && WATCHDOG_ACTIVITY_EVENTS.has(event.type)) touchWatchdog(sid)
+  if (sid && (event.type === "session.tool.input.started" || event.type === "session.tool.called" || event.type === "session.tool.success" || event.type === "session.tool.failed")) {
+    noteTool(sid, event)
+  }
+  if (event.type === "permission.asked") enqueueEvent(() => onPermissionAsked(dir, event.data))
+  if (sid && event.type === "permission.replied") {
+    const w = watchdogs.get(sid)
+    if (w) w.waiting = false
+  }
+  if (sid && event.type === "session.compacted") lastCompacted.set(sid, Date.now())
+  const job = eventJob(dir, event)
+  if (!job) return
+  // Handle events off the bus in arrival order to avoid deadlock.
+  enqueueEvent(job)
+}
 
-  return {
-    async config(cfg: any) {
-      injectAgent(cfg, "architect", {
+// All design_* tools, registered together in setup.
+const TOOL_DEFINITIONS: Record<string, any> = {
+  design_start: DESIGN_START,
+  design_config: DESIGN_CONFIG,
+  design_add_requirement: DESIGN_ADD_REQUIREMENT,
+  design_amend_requirement: DESIGN_AMEND_REQUIREMENT,
+  design_confirm_requirements: DESIGN_CONFIRM_REQUIREMENTS,
+  design_begin_round: DESIGN_BEGIN_ROUND,
+  design_record_evidence: DESIGN_RECORD_EVIDENCE,
+  design_record_decision: DESIGN_RECORD_DECISION,
+  design_submit_verdict: DESIGN_SUBMIT_VERDICT,
+  design_respond: DESIGN_RESPOND,
+  design_dispatch: DESIGN_DISPATCH,
+  design_decompose: DESIGN_DECOMPOSE,
+  design_decide: DESIGN_DECIDE,
+  design_escalations: DESIGN_ESCALATIONS,
+  design_status: DESIGN_STATUS,
+  design_list: DESIGN_LIST,
+  design_get_context: DESIGN_GET_CONTEXT,
+  design_protocol: DESIGN_PROTOCOL,
+  design_pause: DESIGN_PAUSE,
+  design_resume: DESIGN_RESUME,
+  design_stop: DESIGN_STOP,
+}
+
+// Wake the Referee session to put the proceed/cancel question to the user.
+async function ensureRefereeAgent(client: any, sessionID: string) {
+  try {
+    // Only built-in primaries (build) are trusted to carry the question tool.
+    const session = await client.session.get({ sessionID })
+    if (session?.agent && session.agent !== "build") await client.session.switchAgent({ sessionID, agent: "build" })
+  } catch {
+  }
+}
+
+export default {
+  id: "opencode-crucible",
+  async setup(ctx: Plugin.Context) {
+    const directory = path.resolve(ctx.location?.directory || process.cwd())
+    CONTEXTS.set(directory, ctx)
+    OPTIONS = ctx.options || {}
+    let disposed = false
+
+    // Inject (or refresh) the Architect and Falsifier agents; a user's own agent config wins where set.
+    const roleModel = (ref: any) => {
+      const model = parseModelRef(ref)
+      return model ? { providerID: model.providerID, id: model.modelID } : undefined
+    }
+    await ctx.agent.transform((editor: any) => {
+      injectAgent(editor, "architect", {
+        name: "Architect",
         description: "Crucible Architect: generates and revises the system design and its documentation.",
-        mode: "subagent",
-        model: OPTIONS.architectModel,
-        temperature: 0.4,
-        permission: { edit: "allow", bash: bashPerm },
-        prompt: ARCHITECT_PROMPT,
+        model: roleModel(OPTIONS.architectModel),
+        system: ARCHITECT_PROMPT,
       })
-      injectAgent(cfg, "falsifier", {
+      injectAgent(editor, "falsifier", {
+        name: "Falsifier",
         description: "Crucible Falsifier: adversarially attacks a design and reports evidence-backed findings.",
-        mode: "subagent",
-        model: OPTIONS.falsifierModel,
-        temperature: 0.2,
-        permission: { edit: "allow", bash: bashPerm },
-        prompt: FALSIFIER_PROMPT,
+        model: roleModel(OPTIONS.falsifierModel),
+        system: FALSIFIER_PROMPT,
       })
-      // The Referee runs under the built-in build agent so it has the question tool.
-      cfg.command = cfg.command || {}
-      cfg.command.crucible = {
+    })
+
+    // The Referee command forwards the prompt under the built-in build agent.
+    await ctx.command.transform((editor: any) => {
+      editor.add({
+        name: "crucible",
         description: "Start a Crucible adversarial design run for a system.",
-        agent: "build",
-        template: `${REFEREE_PROMPT}\n\n${COMMAND_TEMPLATE}`,
-      }
-      // Recover stale runs only after the agents/command are injected.
-      if (!recoveredDirs.has(directory)) {
-        recoveredDirs.add(directory)
-        setTimeout(() => {
-          if (!disposed) void recoverRuns(directory).catch(() => {})
-        }, 2000)
-      }
-    },
+        execute: async ({ sessionID, prompt, delivery }: any) => {
+          await ensureRefereeAgent(ctx, sessionID)
+          await ctx.session.prompt({
+            sessionID,
+            text: `${REFEREE_PROMPT}\n\n${COMMAND_TEMPLATE.split("$ARGUMENTS").join(String(prompt?.text || "").trim())}`,
+            delivery,
+          })
+        },
+      })
+    })
 
-    tool: {
-      design_start: DESIGN_START,
-      design_config: DESIGN_CONFIG,
-      design_add_requirement: DESIGN_ADD_REQUIREMENT,
-      design_amend_requirement: DESIGN_AMEND_REQUIREMENT,
-      design_confirm_requirements: DESIGN_CONFIRM_REQUIREMENTS,
-      design_begin_round: DESIGN_BEGIN_ROUND,
-      design_record_evidence: DESIGN_RECORD_EVIDENCE,
-      design_record_decision: DESIGN_RECORD_DECISION,
-      design_submit_verdict: DESIGN_SUBMIT_VERDICT,
-      design_respond: DESIGN_RESPOND,
-      design_dispatch: DESIGN_DISPATCH,
-      design_decompose: DESIGN_DECOMPOSE,
-      design_decide: DESIGN_DECIDE,
-      design_escalations: DESIGN_ESCALATIONS,
-      design_status: DESIGN_STATUS,
-      design_list: DESIGN_LIST,
-      design_get_context: DESIGN_GET_CONTEXT,
-      design_protocol: DESIGN_PROTOCOL,
-      design_pause: DESIGN_PAUSE,
-      design_resume: DESIGN_RESUME,
-      design_stop: DESIGN_STOP,
-    },
+    // Direct tools (not code-mode): the agents call design_* by name.
+    await ctx.tool.transform((editor: any) => {
+      for (const [name, def] of Object.entries(TOOL_DEFINITIONS)) {
+        editor.add({
+          name,
+          description: def.description,
+          input: z.toJSONSchema(z.object(def.args), { target: "draft-2020-12" }),
+          options: { codemode: false },
+          execute: async (input: any, toolCtx: any) => ({ content: String(await def.execute(input, { ...toolCtx, directory })) }),
+        })
+      }
+    })
 
-    async event({ event }: any) {
+    await ctx.tool.hook("execute.before", async (event: any) => {
       try {
-        const sid = eventSessionID(event)
-        // Real work from a dispatched child resets its inactivity window.
-        if (sid && WATCHDOG_ACTIVITY_EVENTS.has(event.type)) touchWatchdog(sid)
-        if (sid && event.type === "message.part.updated") noteTool(sid, event.properties?.part)
-        if (event.type === "permission.asked") enqueueEvent(() => onPermissionAsked(directory, event.properties))
-        if (sid && event.type === "permission.replied") {
-          const w = watchdogs.get(sid)
-          if (w) w.waiting = false
-        }
-        if (sid && event.type === "session.compacted") lastCompacted.set(sid, Date.now())
-        const job = eventJob(directory, event)
-        if (!job) return
-        // Handle events off the bus in arrival order to avoid deadlock.
-        enqueueEvent(job)
-      } catch {
-        // never let an event handler reject into the bus
-      }
-    },
-
-    // Mark every process a dispatched agent starts so killMarked can reap it (daemons escape process groups).
-    async "shell.env"(input: any, output: any) {
-      try {
-        const caller = input?.sessionID ? await callerRun(directory, input.sessionID) : null
+        if (String(event?.tool).toLowerCase() !== "shell") return
+        const input = event.input as any
+        if (!input || typeof input.command !== "string") return
+        // Only plugin-dispatched sessions are guarded.
+        const caller = await callerRun(directory, event.sessionID)
         if (!caller) return
-        output.env.CRUCIBLE_SESSION = input.sessionID
-        output.env.CRUCIBLE_WORKTREE = directory
-        output.env.CRUCIBLE_SCRATCH = runScratch(caller.slug)
-      } catch {
-      }
-    },
-
-    async "tool.execute.after"(input: any, output: any) {
-      try {
-        if (String(input?.tool).toLowerCase() !== "bash" || !(await callerRun(directory, input.sessionID))) return
-        const runs = shellRuns.get(input.sessionID) || []
-        runs.push({ command: String(input.args?.command ?? "").trim(), output: String(output?.output ?? ""), exit: typeof output?.metadata?.exit === "number" ? output.metadata.exit : null, at: Date.now() })
-        shellRuns.set(input.sessionID, runs.slice(-20))
+        shellOriginals.set(shellKey(event.sessionID, String(event.id)), input.command.trim())
+        // Label containers so cleanup can find them (the daemon, not the shell, starts them).
+        const labels = `--label crucible.session=${event.sessionID} --label crucible.worktree=${shq(directory)}`
+        input.command = input.command.replace(/\b((?:docker|podman)(?:\s+container)?\s+run)\b/g, `$1 ${labels.replace(/\$/g, "$$$$")}`)
+        // Mark every process the turn starts so killMarked can reap it (V1's shell.env; POSIX shells only).
+        if (process.platform !== "win32") {
+          input.command = `export CRUCIBLE_SESSION=${shq(event.sessionID)} CRUCIBLE_WORKTREE=${shq(directory)} CRUCIBLE_SCRATCH=${shq(runScratch(caller.slug))}; ${input.command}`
+        }
       } catch {
         // never throw from a hook
       }
-    },
+    })
 
-    async "tool.execute.before"(input: any, output: any) {
+    await ctx.tool.hook("execute.after", async (event: any) => {
       try {
-        const sid = input?.sessionID
-        if (!sid) return
-        const toolName = String(input?.tool || "").toLowerCase()
-        const shell = toolName === "bash"
-        const files = shell ? [] : writtenPaths(toolName, output?.args)
-        if (!shell && files.length === 0) return
-        // Only plugin-dispatched sessions are guarded.
-        const caller = await callerRun(directory, sid)
-        if (!caller) return
-        if (shell) {
-          // Label containers so cleanup can find them (the daemon, not the shell, starts them).
-          const c = output?.args?.command
-          if (typeof c === "string") {
-            const labels = `--label crucible.session=${sid} --label crucible.worktree='${directory.replace(/'/g, `'\\''`)}'`
-            output.args.command = c.replace(/\b((?:docker|podman)(?:\s+container)?\s+run)\b/g, `$1 ${labels.replace(/\$/g, "$$$$")}`)
-          }
-          if (effectiveShellPolicy(caller.state) === "allow") return // per-run: guard disabled
-          const cmd = String(output?.args?.command ?? output?.args?.cmd ?? "")
-          if (isDestructive(cmd)) throw new Error("Crucible guard: destructive or repository-changing command blocked (read-only git such as status, log, diff and show is allowed).")
-          return
-        }
-        for (const file of files) {
-          const problem = fileGuard(directory, caller, file)
-          if (problem) throw new Error(`Crucible guard: ${problem}`)
-        }
-      } catch (e: any) {
-        if (String(e?.message || "").includes("Crucible guard")) throw e
+        if (String(event?.tool).toLowerCase() !== "shell") return
+        if (!(await callerRun(directory, event.sessionID))) return
+        const key = shellKey(event.sessionID, String(event.id))
+        const original = shellOriginals.get(key)
+        shellOriginals.delete(key)
+        const command = original ?? String((event.input as any)?.command ?? "").trim()
+        const result = shellResult(event.status === "completed" ? event.result : undefined)
+        const runs = shellRuns.get(event.sessionID) || []
+        runs.push({ command, output: result.output, exit: result.exit, at: Date.now() })
+        shellRuns.set(event.sessionID, runs.slice(-20))
+      } catch {
+        // never throw from a hook
       }
-    },
+    })
 
-    async "experimental.session.compacting"(input: any, output: any) {
+    // The V1 tool.execute.before guards, as V2 permission decisions.
+    await ctx.permission.hook("evaluate", async (event: any) => {
       try {
-        const sid = input?.sessionID
-        if (!sid) return
+        await onPermissionEvaluate(directory, event)
+      } catch {
+      }
+    })
+
+    // Keep the run state visible across compaction (V1's experimental.session.compacting).
+    await ctx.session.hook("compaction", async (event: any) => {
+      try {
+        const sid = event?.sessionID
+        if (!sid || !Array.isArray(event.system)) return
         const slug = await resolveSlug(directory, undefined, sid)
         if (!slug) return
         const state = await readState(directory, slug)
@@ -2931,21 +2992,48 @@ export const server = async (input: any, options?: any) => {
         const open = state.open_findings
           .filter((f: any) => !["resolved", "accepted_risk"].includes(f.status))
           .map((f: any) => f.id)
-        output.context.push(
-          `Crucible run '${slug}' (${state.system})${role ? `, you are its ${role}` : ""}: phase=${state.phase}, round=${state.round}, revision=${state.design_revision}, design_dir=${relDesignDir(directory, slug)}, coverage_gaps=[${state.coverage.gaps.join(", ")}], open_findings=[${open.join(", ")}]. Keep this run active; do not re-elicit requirements after compaction.`,
-        )
+        event.system.push({
+          type: "text",
+          text: `Crucible run '${slug}' (${state.system})${role ? `, you are its ${role}` : ""}: phase=${state.phase}, round=${state.round}, revision=${state.design_revision}, design_dir=${relDesignDir(directory, slug)}, coverage_gaps=[${state.coverage.gaps.join(", ")}], open_findings=[${open.join(", ")}]. Keep this run active; do not re-elicit requirements after compaction.`,
+        })
       } catch {
       }
-    },
+    })
 
-    async dispose() {
+    // The public V2 event stream carries every location's events; handle only this worktree's.
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event?.location && directory && event.location.directory !== directory) continue
+          try {
+            await handleBusEvent(directory, event)
+          } catch {
+            // never let an event handler reject into the stream
+          }
+        }
+      } catch {
+      }
+    })()
+
+    // Recover stale runs once the agents, command, and tools are registered.
+    if (!recoveredDirs.has(directory)) {
+      recoveredDirs.add(directory)
+      setTimeout(() => {
+        if (!disposed) void recoverRuns(directory).catch(() => {})
+      }, 2000)
+    }
+
+    return async () => {
       disposed = true
+      controller.abort()
       killMarked(`CRUCIBLE_WORKTREE=${directory}`)
       // A re-created instance for this worktree recovers its runs again.
       recoveredDirs.delete(directory)
+      if (CONTEXTS.get(directory) === ctx) CONTEXTS.delete(directory)
       // Only this instance's watchdogs: other instances in the process keep theirs.
       for (const [id, w] of [...watchdogs]) if (path.resolve(w.dir) === directory) watchdogs.delete(id)
       if (watchdogs.size === 0) stopWatchdogSweeper()
-    },
-  }
+    }
+  },
 }

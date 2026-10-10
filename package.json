@@ -1,10 +1,13 @@
 {
   "name": "@serhaturtis/opencode-crucible",
-  "version": "0.1.0",
-  "description": "Adversarial design loop for opencode: an Architect generates a design, a Falsifier attacks it with evidence-backed findings, and the plugin is the Referee. Ships a TUI status panel.",
+  "version": "0.2.0",
+  "description": "Adversarial design loop for opencode (v2): an Architect generates a design, a Falsifier attacks it with evidence-backed findings, and the plugin is the Referee. Ships a TUI status panel.",
   "type": "module",
   "license": "MIT",
   "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
     "./server": {
       "import": "./dist/server.js"
     },
@@ -14,17 +17,25 @@
   },
   "files": [
     "dist",
+    "server.ts",
+    "tui.ts",
     "src/tui.ts"
   ],
   "scripts": {
-    "build": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --entry-naming server.js",
+    "build": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode/plugin --external zod --entry-naming server.js",
     "test": "bun test",
     "pack": "bun pm pack",
     "prepublishOnly": "bun run build"
   },
+  "dependencies": {
+    "zod": "^4.1.8"
+  },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*",
-    "@opentui/solid": "*",
-    "solid-js": "*"
+    "@opencode/plugin": ">=2.0.0",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.26"
   }
 }
