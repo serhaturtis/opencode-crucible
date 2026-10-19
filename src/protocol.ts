@@ -302,15 +302,17 @@ Every finding ends as one of these; the plugin never silently drops one.
 - The ledger is the source of truth but is **amendable**.
 - A ruling that changes what a requirement says should be followed by \`design_amend_requirement\`, which bumps the version and keeps the old text in its history.
 - The Falsifier may cite existing IDs and may file \`requirement_gap\` findings,
-  which escalate to the user. List pending escalations with \`design_escalations\`
+  which are put to the user after the Architect's answer unless that answer
+  settles them. List pending escalations with \`design_escalations\`
   and ratify one with \`design_decide\` (it locates the finding across the effort,
   root or subsystem).
 - A blocker/major in \`needs_adjudication\` that is contested, Falsifier-requested
   (\`action: "needs_adjudication"\`), or \`disputed\` is escalated to the user and
   HELD on the board across rounds until the user decides, even if the Falsifier
   does not re-raise it; contested ones keep gating convergence until decided.
-  Falsifier-requested rulings are escalated at verdict time, while the Architect
-  works. The Architect's answer to one (even \`fix\`) is only a proposal, so it stays
+  Falsifier-requested rulings are recorded at verdict time and put to the user
+  after the Architect answers, so "Ratify as resolved" can consider its proposal.
+  The Architect's answer to one (even \`fix\`) is only a proposal, so it stays
   \`needs_adjudication\` until the user rules; a verified one gates until then. The
   loop does not pause for it, and the Architect may still answer a held finding
   by its id in a later round. User rulings: "Ratify as resolved" accepts the
@@ -320,8 +322,12 @@ Every finding ends as one of these; the plugin never silently drops one.
   that is between rounds, \`budget_stopped\`, or \`no_progress\` only because of that
   finding finishes as \`converged\` / \`accepted_with_reservations\` if it now
   qualifies.
-- An escalation is surfaced as a **question dialog**: when one is raised (and
-  again after a restart) the plugin prompts the Referee, which MUST call the
+- A ruling on a finding the Architect has already settled (resolved or accepted
+  as a risk) is a no-op; reopening it is still allowed.
+- An escalation is surfaced as a **question dialog**: a finding escalation is put
+  to the user after the Architect answers its round (its answer can settle it),
+  a guard notice when it is raised, and pending ones again after a restart. The
+  plugin prompts the Referee, which MUST call the
   \`question\` tool with per-item choices ("Ratify as resolved" / "Accept the
   risk" / "Reopen" / "Leave for now") and then call \`design_decide\` for the
   chosen action — describing the choices in text is not sufficient. A subsystem

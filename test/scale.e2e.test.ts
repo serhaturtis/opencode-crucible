@@ -836,8 +836,8 @@ test("design_decide recomputes a child's parent block", async () => {
   }
 })
 
-test("a binding requirement_gap escalates to the user", async () => {
-  const { dir, hooks, call } = await harness()
+test("a binding requirement_gap is escalated after the Architect answers, and withdrawn when fixed", async () => {
+  const { dir, client, ctx, hooks, call } = await harness()
   try {
     await call("design_start", { system: "Gap", brief: "b", slug: "gap", mode: "fast" })
     await call("design_add_requirement", { slug: "gap", text: "r", priority: "must" })
@@ -847,9 +847,12 @@ test("a binding requirement_gap escalates to the user", async () => {
     const v = { round: 1, verdict: "changes_required", findings: [{ id: "F-1", severity: "major", category: "requirement_gap", claim: "c", counterexample: "x", evidence: { class: "authoritative", verification: "verified" }, requirement_ids: ["R-001"], artifact_ref: "03-architecture.md#x", action: "open" }], coverage: fullCov, no_new_falsifiable_claim: false }
     await call("design_submit_verdict", { slug: "gap", verdict_json: JSON.stringify(v) })
     expect((await readState(dir, "gap")).escalation?.requirement_id).toBe("F-1")
+    // Recorded, but the user is not asked before the Architect has answered.
+    expect(client.prompts.some((p: any) => p?.sessionID === ctx.sessionID)).toBe(false)
     // resolving the finding withdraws the escalation
     await call("design_respond", { slug: "gap", response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [{ finding_id: "F-1", disposition: "fix", rationale: "handled" }] }) })
     expect((await readState(dir, "gap")).escalation).toBe(null)
+    expect(client.prompts.some((p: any) => p?.sessionID === ctx.sessionID)).toBe(false)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -993,6 +996,33 @@ test("a user adjudication survives a later architect response", async () => {
     await call("design_respond", { slug: "adj", response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [] }) })
     const f = (await readState(dir, "adj")).open_findings.find((x: any) => x.id === "F-001")
     expect(f.status).toBe("resolved")
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a stale ruling does not undo a finding the Architect already settled", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await call("design_start", { system: "Stale", brief: "b", slug: "stale", mode: "fast" })
+    await call("design_add_requirement", { slug: "stale", text: "r", priority: "must" })
+    await call("design_confirm_requirements", { slug: "stale" })
+    await call("design_respond", { slug: "stale", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    await call("design_begin_round", { slug: "stale" })
+    await call("design_submit_verdict", { slug: "stale", verdict_json: findingsVerdict(1, ["F-001"]) })
+    await call("design_respond", { slug: "stale", response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [{ finding_id: "F-001", disposition: "fix" }] }) })
+    expect((await readState(dir, "stale")).open_findings.find((f: any) => f.id === "F-001").status).toBe("resolved")
+    // A question answered after the fix landed must not accept a risk that no longer exists.
+    const settled = j(await call("design_decide", { slug: "stale", finding_id: "F-001", decision: "accepted_risk" }))
+    expect(settled.already).toBe(true)
+    const st = await readState(dir, "stale")
+    expect(st.open_findings.find((f: any) => f.id === "F-001").status).toBe("resolved")
+    expect(st.risks.some((r: any) => r.id === "F-001")).toBe(false)
+    expect(j(await call("design_decide", { slug: "stale", finding_id: "F-001", decision: "resolved" })).already).toBe(true)
+    // The user can still reopen it deliberately.
+    expect((await call("design_decide", { slug: "stale", finding_id: "F-001", decision: "reopen" })).ok).not.toBe(false)
+    expect((await readState(dir, "stale")).open_findings.find((f: any) => f.id === "F-001").status).toBe("binding")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -1817,15 +1847,17 @@ test("auto-ingest at the round budget starts integration instead of stopping the
 })
 
 test("a new verdict withdraws the previous round's finding escalations", async () => {
-  const { dir, hooks, call } = await harness()
+  const { dir, client, ctx, hooks, call } = await harness()
   try {
     await readyRun(call, "esr", { mode: "standard" })
     await call("design_respond", { slug: "esr", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
     await call("design_begin_round", { slug: "esr" })
     const gap = (round: number) => JSON.stringify({ round, verdict: "changes_required", findings: [{ id: "F-1", severity: "major", category: round === 1 ? "requirement_gap" : "data", claim: `c${round}`, counterexample: "x", evidence: { class: "authoritative", verification: "verified" }, requirement_ids: ["R-001"], artifact_ref: "03-architecture.md#x" }], coverage: fullCov, no_new_falsifiable_claim: false })
     await call("design_submit_verdict", { slug: "esr", verdict_json: gap(1) })
+    expect(client.prompts.some((p: any) => p?.sessionID === ctx.sessionID)).toBe(false)
     await call("design_respond", { slug: "esr", response_json: JSON.stringify({ round: 1, responses: [] }) })
     expect((await readState(dir, "esr")).escalations.some((e: any) => e.requirement_id === "F-1")).toBe(true)
+    expect(client.prompts.some((p: any) => p?.sessionID === ctx.sessionID && promptText(p).includes("F-1"))).toBe(true)
     await call("design_begin_round", { slug: "esr" })
     // Round 2's F-1 is an unrelated data finding: the round-1 gap escalation is gone.
     await call("design_submit_verdict", { slug: "esr", verdict_json: gap(2) })
@@ -1963,11 +1995,16 @@ test("a Falsifier-requested finding is escalated at verdict time, stays held aft
     let st = await readState(dir, "ask")
     expect(st.phase).toBe("responding")
     expect(st.escalations.some((e: any) => e.requirement_id === "F-001")).toBe(true)
-    expect((client.prompts as any[]).some((p) => p?.sessionID === ctx.sessionID && promptText(p).includes("F-001"))).toBe(true)
+    // Not put to the user until the Architect has answered.
+    expect((client.prompts as any[]).some((p) => p?.sessionID === ctx.sessionID && promptText(p).includes("F-001"))).toBe(false)
     await call("design_respond", { slug: "ask", response_json: JSON.stringify({ round: 1, responses: [{ finding_id: "F-001", disposition: "fix" }] }) })
     st = await readState(dir, "ask")
     expect(st.open_findings.find((f: any) => f.id === "F-001")).toMatchObject({ status: "needs_adjudication", contested: true })
     expect(st.history[0].gate).toBe(1)
+    // Now the Referee is woken with the Architect's answer in hand.
+    const asked = (client.prompts as any[]).find((p) => p?.sessionID === ctx.sessionID && promptText(p).includes("F-001"))
+    expect(asked).toBeTruthy()
+    expect(promptText(asked)).toContain("Architect answered fix")
     await call("design_decide", { slug: "ask", finding_id: "F-001", decision: "reopen" })
     st = await readState(dir, "ask")
     expect(st.adjudications["F-001"]).toEqual({ decision: "binding", round: 1 })

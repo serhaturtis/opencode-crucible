@@ -145,7 +145,7 @@ export function awaitsUser(f: any) {
 
 export function adjudicationWhy(f: any) {
   const gates = f?.contested ? "; it gates until you decide" : ""
-  if (f?.action === "needs_adjudication") return `the Falsifier asks for your ruling${gates}`
+  if (f?.action === "needs_adjudication") return `the Falsifier asks for your ruling${f.disposition ? ` (the Architect answered ${f.disposition})` : ""}${gates}`
   if (f?.contested && (f.disposition === "accept_risk" || f.disposition === "wont_fix")) return `the Architect proposes ${f.disposition} on a verified ${f.severity}${gates}`
   if (f?.contested) return `rebutted without verified evidence${gates}`
   if (f?.verification === "disputed") return "its evidence is disputed"

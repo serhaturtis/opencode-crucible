@@ -2190,7 +2190,7 @@ const DESIGN_SUBMIT_VERDICT = tool({
         applyValidation(state, round, verdict, null)
         // The previous round's finding escalations are moot now.
         withdrawStaleEscalations(state)
-        // Put the user's questions to them now, while the Architect works: rulings the Falsifier asked for and gate-worthy gaps.
+        // Record the escalations now, but put them to the user only after the Architect answers: a fix can settle them.
         for (const f of state.open_findings) {
           if (f.round !== round || f.status === "rejected_noise") continue
           if (awaitsUser(f)) addEscalation(state, { requirement_id: f.id, kind: "finding", round, reason: `${f.severity} ${f.id}: ${adjudicationWhy(f)}` })
@@ -2198,7 +2198,6 @@ const DESIGN_SUBMIT_VERDICT = tool({
             addEscalation(state, { requirement_id: f.id, kind: "finding", round, reason: `requirement_gap finding '${f.id}' needs user ratification` })
           }
         }
-        await notifyEscalations(ctx.directory, state)
         state.phase = "responding"
         // A verification pass settles the pending acceptance without another Architect turn.
         if (state.verify) {
@@ -2209,6 +2208,8 @@ const DESIGN_SUBMIT_VERDICT = tool({
         const ingested = state.phase === "awaiting_decomposition" && (await holdForDecomposition(ctx.directory, slug, state))
         await propagateBlocks(ctx.directory, state, false)
         await finalizeTerminal(ctx.directory, state)
+        // A terminal verdict can still leave a held finding for the user; only non-terminal rounds defer to the Architect.
+        if (TERMINAL.has(state.phase)) await notifyEscalations(ctx.directory, state)
         await saveState(ctx.directory, state)
         if (ingested) await pumpChildren(ctx.directory, slug)
         if (TERMINAL.has(state.phase)) await afterRunChange(ctx.directory, state)
@@ -2474,6 +2475,16 @@ const DESIGN_DECIDE = tool({
     return lockedState(ctx.directory, target, ctx.sessionID, async (slug, state) => {
       const finding = state.open_findings.find((f: any) => f.id === args.finding_id)
       if (!finding) return JSON.stringify({ ok: false, error: `Unknown finding '${args.finding_id}'.` }, null, 2)
+      // A question can outlive the Architect's answer: do not let a stale "resolve"/"accept risk" undo a settled finding.
+      const settled = finding.status === "resolved" || finding.status === "accepted_risk"
+      const escalated = pendingEscalations(state).some((e: any) => e.requirement_id === args.finding_id)
+      if (settled && !escalated && args.decision !== "reopen") {
+        return JSON.stringify(
+          { ok: true, slug, already: true, finding, reason: `finding '${args.finding_id}' is already ${finding.status}; no user ruling was applied` },
+          null,
+          2,
+        )
+      }
       state.adjudications = state.adjudications || {}
       const round = finding.round ?? state.round
       if (args.decision === "reopen") {
