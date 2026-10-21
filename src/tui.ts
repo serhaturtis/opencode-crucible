@@ -245,13 +245,14 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
   })
   const frame = () => SPINNER[spin() % SPINNER.length]
 
-  // A compact tree: one branch per design. The current run gets a status line
-  // and a metrics line; other designs get one status line. No line wraps; the
-  // tree characters provide grouping without consuming a full border column.
+  // A panel with a focus area, a tree list and section rules:
+  //   header / rule / current design / rule / other designs / rule / command.
+  // Every line is single-line and width-constrained; nothing wraps.
   const lines = () => {
     const d = data()
     const f = frame()
     const out: string[] = []
+    const RULE = "─".repeat(32)
     const status = (run: Run) => {
       const a = activity(run.state, f)
       const phase = String(run.state.phase || "?")
@@ -260,8 +261,7 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
     const metrics = (run: Run) => {
       const s = run.state
       const base = Number(s.integration_base_round) > 0 ? Number(s.integration_base_round) : 0
-      const budget = `${base ? "int " : ""}${(s.round ?? 0) - base}/${s.budgets?.max_rounds ?? "?"}`
-      const last = Array.isArray(s.history) ? s.history.at(-1) : undefined
+      const round = `${base ? "int " : ""}${(s.round ?? 0) - base}/${s.budgets?.max_rounds ?? "?"}`
       const open = (Array.isArray(s.open_findings) ? s.open_findings : []).filter(
         (x: any) => !["resolved", "accepted_risk"].includes(x?.status),
       ).length
@@ -269,12 +269,12 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
         (x: any) => gating(x) && !["resolved", "accepted_risk"].includes(x?.status),
       ).length
       return [
-        `${s.budgets?.mode ?? "?"} ${budget}`,
+        `${s.budgets?.mode ?? "?"} · round ${round}`,
         open ? `${open} open` : "",
         gate ? `${gate} gate` : "",
-        last ? `score ${last.score}` : "",
       ].filter(Boolean).join(" · ")
     }
+    out.push(RULE)
     d.efforts.forEach((effort, index) => {
       const last = index === d.efforts.length - 1
       const branch = last ? "└─ " : "├─ "
@@ -287,6 +287,7 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
       if (current) {
         out.push(`${rail}${status(current)}`)
         out.push(`${rail}${metrics(current)}`)
+        if (d.efforts.length > 1) out.push(RULE)
       } else {
         const lead = effortLead(effort)
         const from = lead.slug !== effort.root ? `${displayName(lead.slug)} · ` : ""
@@ -294,8 +295,9 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
       }
     })
     if (!d.efforts.length) out.push("  no active designs")
+    out.push(RULE)
     const foot = [d.more > 0 ? `+${d.more} more` : "", d.hidden > 0 ? `${d.hidden} hidden` : ""].filter(Boolean)
-    out.push(`  /crucible${foot.length ? ` · ${foot.join(" · ")}` : ""}`)
+    out.push(`/crucible${foot.length ? ` · ${foot.join(" · ")}` : ""}`)
     return out
   }
 
