@@ -245,60 +245,68 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
   })
   const frame = () => SPINNER[spin() % SPINNER.length]
 
-  // One effort per design. The current effort gets a compact status line and a
-  // metrics line; other efforts get one status line. The sidebar is narrow, so
-  // every line is single-line/truncated and names are shortened before display.
+  // A compact tree: one branch per design. The current run gets a status line
+  // and a metrics line; other designs get one status line. No line wraps; the
+  // tree characters provide grouping without consuming a full border column.
   const lines = () => {
     const d = data()
     const f = frame()
     const out: string[] = []
-    for (const effort of d.efforts) {
-      const lead = effortLead(effort)
+    const status = (run: Run) => {
+      const a = activity(run.state, f)
+      const phase = String(run.state.phase || "?")
+      return a.label === phase ? phase : `${phase} · ${a.label}`
+    }
+    const metrics = (run: Run) => {
+      const s = run.state
+      const base = Number(s.integration_base_round) > 0 ? Number(s.integration_base_round) : 0
+      const budget = `${base ? "int " : ""}${(s.round ?? 0) - base}/${s.budgets?.max_rounds ?? "?"}`
+      const last = Array.isArray(s.history) ? s.history.at(-1) : undefined
+      const open = (Array.isArray(s.open_findings) ? s.open_findings : []).filter(
+        (x: any) => !["resolved", "accepted_risk"].includes(x?.status),
+      ).length
+      const gate = (Array.isArray(s.open_findings) ? s.open_findings : []).filter(
+        (x: any) => gating(x) && !["resolved", "accepted_risk"].includes(x?.status),
+      ).length
+      return [
+        `${s.budgets?.mode ?? "?"} ${budget}`,
+        open ? `${open} open` : "",
+        gate ? `${gate} gate` : "",
+        last ? `score ${last.score}` : "",
+      ].filter(Boolean).join(" · ")
+    }
+    d.efforts.forEach((effort, index) => {
+      const last = index === d.efforts.length - 1
+      const branch = last ? "└─ " : "├─ "
+      const rail = last ? "   " : "│  "
       const current = d.cur ? effort.runs.find((r) => r.slug === d.cur) : undefined
       const need = effort.runs.some((r) => needsYou(r.state)) ? "! " : ""
-      const marker = effort.root === d.currentRoot ? "▸ " : "  "
+      const marker = effort.root === d.currentRoot ? "▸ " : ""
       const who = current && current.slug !== effort.root ? ` › ${displayName(current.slug)}` : ""
-      out.push(`${marker}${need}${displayName(effort.root)}${who}`)
+      out.push(`${branch}${marker}${need}${displayName(effort.root)}${who}`)
       if (current) {
-        const a = activity(current.state, f)
-        const phase = String(current.state.phase || "?")
-        const status = a.label === phase ? phase : `${phase} · ${a.label}`
-        const last = Array.isArray(current.state.history) ? current.state.history.at(-1) : undefined
-        const base = Number(current.state.integration_base_round) > 0 ? Number(current.state.integration_base_round) : 0
-        const budget = `${base ? "int " : ""}${(current.state.round ?? 0) - base}/${current.state.budgets?.max_rounds ?? "?"}`
-        const open = (Array.isArray(current.state.open_findings) ? current.state.open_findings : []).filter(
-          (x: any) => !["resolved", "accepted_risk"].includes(x?.status),
-        ).length
-        const gate = (Array.isArray(current.state.open_findings) ? current.state.open_findings : []).filter(
-          (x: any) => gating(x) && !["resolved", "accepted_risk"].includes(x?.status),
-        ).length
-        const metrics = [
-          `${current.state.budgets?.mode ?? "?"} ${budget}`,
-          open ? `${open} open` : "0 open",
-          gate ? `${gate} gate` : "0 gate",
-          last ? `score ${last.score}` : "",
-        ].filter(Boolean).join(" · ")
-        out.push(`  ${status}`)
-        out.push(`  ${metrics}`)
+        out.push(`${rail}${status(current)}`)
+        out.push(`${rail}${metrics(current)}`)
       } else {
-        const a = activity(lead.state, f)
-        const phase = String(lead.state.phase || "?")
-        const status = a.label === phase ? phase : `${phase} · ${a.label}`
+        const lead = effortLead(effort)
         const from = lead.slug !== effort.root ? `${displayName(lead.slug)} · ` : ""
-        out.push(`  ${from}${status}`)
+        out.push(`${rail}${from}${status(lead)}`)
       }
-    }
+    })
+    if (!d.efforts.length) out.push("  no active designs")
     const foot = [d.more > 0 ? `+${d.more} more` : "", d.hidden > 0 ? `${d.hidden} hidden` : ""].filter(Boolean)
     out.push(`  /crucible${foot.length ? ` · ${foot.join(" · ")}` : ""}`)
     return out
   }
 
-  const lineProps = { fg: theme.text.muted, wrapMode: "none" as const, truncate: true }
-  const children: Child[] = [text({ fg: theme.text.base, wrapMode: "none" as const, truncate: true }, ["Crucible"])]
+  const lineProps = { fg: theme.text.muted, wrapMode: "none" as const, truncate: true, width: "100%" as const }
+  const children: Child[] = [
+    text({ fg: theme.text.base, wrapMode: "none" as const, truncate: true, width: "100%" as const }, ["Crucible"]),
+  ]
   for (let i = 0; i < MAX_LINES; i++) {
     children.push(text(lineProps, [() => lines()[i] ?? ""]))
   }
-  return box({ flexDirection: "column" }, children)
+  return box({ flexDirection: "column", width: "100%" }, children)
 }
 
 // The show/hide manager. Visibility is TUI state only; selecting an option never
