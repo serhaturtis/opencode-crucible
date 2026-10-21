@@ -199,12 +199,8 @@ type SidebarData = {
   cur: string | null
   currentRoot: string | null
   efforts: Effort[]
-  more: number
   hidden: number
 }
-
-const MAX_EFFORTS = 3
-const MAX_LINES = 10
 
 function Sidebar(context: any, sessionID: string, visibility: any) {
   const theme = context.theme
@@ -217,16 +213,14 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
       const cur = currentSlug(directory, sessionID)
       const efforts = groupEfforts(collectRuns(directory, sessionID))
       const { visible, hidden } = partitionEfforts(efforts, cur, prefs())
-      const shown = visible.slice(0, MAX_EFFORTS)
       return {
         cur,
         currentRoot: currentEffort(efforts, cur)?.root ?? null,
-        efforts: shown,
-        more: visible.length - shown.length,
+        efforts: visible,
         hidden,
       }
     } catch {
-      return { cur: null, currentRoot: null, efforts: [], more: 0, hidden: 0 }
+      return { cur: null, currentRoot: null, efforts: [], hidden: 0 }
     }
   }
 
@@ -258,6 +252,18 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
       const phase = String(run.state.phase || "?")
       return a.label === phase ? phase : `${phase} · ${a.label}`
     }
+    const compactStatus = (run: Run) => {
+      const s = run.state
+      if (needsYou(s)) return "needs you"
+      if (s.paused) return "paused"
+      const phase = String(s.phase || "?")
+      if (phase === "converged" || phase === "accepted_with_reservations") return "done"
+      if (phase === "designing") return s.dispatch ? "working" : "waiting"
+      if (phase === "responding" || phase === "falsifying" || phase === "verifying") return "review"
+      if (phase === "eliciting") return "awaiting you"
+      if (phase === "awaiting_decomposition") return "confirm"
+      return phase.replaceAll("_", " ")
+    }
     const metrics = (run: Run) => {
       const s = run.state
       const base = Number(s.integration_base_round) > 0 ? Number(s.integration_base_round) : 0
@@ -283,32 +289,43 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
       const need = effort.runs.some((r) => needsYou(r.state)) ? "! " : ""
       const marker = effort.root === d.currentRoot ? "▸ " : ""
       const who = current && current.slug !== effort.root ? ` › ${displayName(current.slug)}` : ""
-      out.push(`${branch}${marker}${need}${displayName(effort.root)}${who}`)
+      const subs = subsystemCounts(effort)
+      const rollup = subs.total ? ` · ${subs.live}/${subs.total} live` : ""
+      out.push(`${branch}${marker}${need}${displayName(effort.root)}${who}${rollup}`)
       if (current) {
         out.push(`${rail}${status(current)}`)
         out.push(`${rail}${metrics(current)}`)
-        if (d.efforts.length > 1) out.push(RULE)
       } else {
         const lead = effortLead(effort)
         const from = lead.slug !== effort.root ? `${displayName(lead.slug)} · ` : ""
         out.push(`${rail}${from}${status(lead)}`)
       }
+
+      // A decomposed run is a tree: show every subsystem run and its state.
+      const kids = effort.runs.filter((r) => r.slug !== effort.root)
+      kids.forEach((child, childIndex) => {
+        const lastChild = childIndex === kids.length - 1
+        const childBranch = lastChild ? "└─ " : "├─ "
+        const childNeed = needsYou(child.state) ? "! " : ""
+        const childMarker = d.cur === child.slug ? "▸ " : ""
+        out.push(`${rail}${childBranch}${childMarker}${childNeed}${displayName(child.slug)} · ${compactStatus(child)}`)
+      })
+      if (index < d.efforts.length - 1) out.push(RULE)
     })
     if (!d.efforts.length) out.push("  no active designs")
     out.push(RULE)
-    const foot = [d.more > 0 ? `+${d.more} more` : "", d.hidden > 0 ? `${d.hidden} hidden` : ""].filter(Boolean)
-    out.push(`/crucible${foot.length ? ` · ${foot.join(" · ")}` : ""}`)
+    const foot = d.hidden > 0 ? ` · ${d.hidden} hidden` : ""
+    out.push(`/crucible${foot}`)
     return out
   }
 
   const lineProps = { fg: theme.text.muted, wrapMode: "none" as const, truncate: true, width: "100%" as const }
-  const children: Child[] = [
+  return box({ flexDirection: "column", width: "100%" }, [
     text({ fg: theme.text.base, wrapMode: "none" as const, truncate: true, width: "100%" as const }, ["Crucible"]),
-  ]
-  for (let i = 0; i < MAX_LINES; i++) {
-    children.push(text(lineProps, [() => lines()[i] ?? ""]))
-  }
-  return box({ flexDirection: "column", width: "100%" }, children)
+    // One multiline text node lets the sidebar's scrollbar own vertical overflow;
+    // there is no artificial row cap.
+    text(lineProps, [() => lines().join("\n")]),
+  ])
 }
 
 // The show/hide manager. Visibility is TUI state only; selecting an option never
