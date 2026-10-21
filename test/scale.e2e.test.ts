@@ -438,6 +438,43 @@ async function convergeChild(call: any, slug: string, coverage: any) {
   await call("design_respond", { slug, response_json: JSON.stringify({ round: 2, design_revision: "v3", responses: [] }) })
 }
 
+test("decomposition drift is surfaced and an accepted root can be re-ingested", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await soloRoot(call, j, dir)
+    const manifest = JSON.parse(JSON.stringify(soloManifest))
+    await call("design_decompose", { slug: "solo", decomposition_json: JSON.stringify(manifest) })
+
+    // Simulate an accepted root with a pre-fix state (no stored digest): the
+    // fallback signature must still detect the amended manifest.
+    const root = await readState(dir, "solo")
+    root.phase = "converged"
+    delete root.decomposition_digest
+    await writeState(dir, "solo", root)
+
+    const amended = JSON.parse(JSON.stringify(manifest))
+    amended.subsystems[0].provides = ["svc.api"]
+    amended.subsystems[0].requires = ["svc.api"]
+    amended.interfaces = [{ from: "svc", to: "svc", contract: "svc.api", system_reqs: ["R-001"] }]
+    await fs.writeFile(path.join(dir, "docs", "design", "solo", "decomposition.json"), JSON.stringify(amended, null, 2))
+
+    const drift = j(await call("design_status", { slug: "solo" }))
+    expect(drift.decomposition.drift).toBe(true)
+    expect(drift.decomposition.error).toContain("design_decompose")
+
+    const re = j(await call("design_decompose", { slug: "solo", decomposition_json: JSON.stringify(amended) }))
+    expect(re.ok).toBe(true)
+    const after = await readState(dir, "solo")
+    expect(after.phase).toBe("converged")
+    expect(after.interfaces.length).toBe(1)
+    expect(after.decomposition_drift).toBe(false)
+    expect(j(await call("design_status", { slug: "solo" })).decomposition.drift).toBe(false)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("root runs an integration round once its subsystem is accepted; rejection reopens it", async () => {
   const { dir, hooks, call, j } = await harness()
   try {
@@ -779,7 +816,7 @@ async function decomposeHold(call: any, slug: string) {
   await call("design_respond", { slug, response_json: JSON.stringify({ round: 1, design_revision: "v2", responses: [] }) })
 }
 
-test("a terminal root refuses a decomposition re-ingest", async () => {
+test("a stopped root refuses a decomposition re-ingest", async () => {
   const { dir, hooks, call, j } = await harness()
   try {
     await decomposeTwo(call, "term2")

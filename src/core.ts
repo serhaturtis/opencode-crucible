@@ -540,6 +540,8 @@ export function newState(slug: string, system: string, sessionID: string | undef
     decomposition_mode: "confirm",
     decomposition_ready: false,
     decomposition_error: null,
+    decomposition_digest: null as string | null,
+    decomposition_drift: false,
     // Integration rounds get their own budget and convergence evidence from here.
     integration_base_round: null as number | null,
     max_parallel: null,
@@ -1201,7 +1203,12 @@ export function summarize(state: any) {
     revision: state.design_revision,
     decompose: state.decompose === true,
     decomposition: state.decompose
-      ? { mode: state.decomposition_mode || "confirm", ready: state.decomposition_ready === true, error: state.decomposition_error || null }
+      ? {
+          mode: state.decomposition_mode || "confirm",
+          ready: state.decomposition_ready === true,
+          error: state.decomposition_error || null,
+          drift: state.decomposition_drift === true,
+        }
       : null,
     integration_base_round: state.integration_base_round ?? null,
     preset: state.preset || state.budgets?.mode || "fast",

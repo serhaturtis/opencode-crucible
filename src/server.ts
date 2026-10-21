@@ -752,6 +752,39 @@ async function readDecompositionManifest(dir: string, slug: string) {
   }
 }
 
+// The decomposition fields the root state and interface gate depend on. The same
+// signature is computed from a manifest and from an ingested state, so a later
+// edit to decomposition.json can be detected without trusting file mtime.
+function decompositionSignature(value: any) {
+  const manifest = value?.subsystems || value?.interfaces || value?.traceability
+    ? value
+    : {
+        version: value?.decomposition_version,
+        max_parallel: value?.max_parallel,
+        subsystems: value?.subsystems,
+        interfaces: value?.interfaces,
+        traceability: value?.traceability,
+      }
+  return digest(JSON.stringify({
+    version: manifest?.version ?? manifest?.decomposition_version ?? null,
+    max_parallel: manifest?.max_parallel ?? null,
+    subsystems: (manifest?.subsystems || []).map((s: any) => ({
+      name: s?.name,
+      depends_on: s?.depends_on || [],
+      provides: s?.provides || [],
+      requires: s?.requires || [],
+      domains: s?.domains || [],
+      requirements: (s?.requirements || []).map((r: any) => ({
+        id: r?.id,
+        priority: r?.priority,
+        system_reqs: r?.system_reqs || [],
+      })),
+    })),
+    interfaces: manifest?.interfaces || [],
+    traceability: manifest?.traceability || [],
+  }))
+}
+
 // Structural validation shared by the tool and the automatic path (caller holds the lock).
 function validateDecomposition(state: any, slug: string, manifest: any) {
   const problems: string[] = []
@@ -785,9 +818,34 @@ function validateDecomposition(state: any, slug: string, manifest: any) {
 async function refreshDecomposition(dir: string, slug: string) {
   return withLock(await lockForRun(dir, slug), async () => {
     const state = await readState(dir, slug)
-    if (!state) return null
-    if (!state.decompose || (state.subsystems || []).length > 0 || state.phase !== "awaiting_decomposition") return state
+    if (!state || !state.decompose) return state
     const manifest = await readDecompositionManifest(dir, slug)
+
+    // An established decomposition is immutable in shape but the file can be
+    // amended by the Architect (the Foundry codegen.api case). Surface the drift
+    // instead of leaving the hand-off on a stale interface set.
+    if ((state.subsystems || []).length > 0) {
+      const stateSig = state.decomposition_digest || decompositionSignature(state)
+      const manifestSig = manifest ? decompositionSignature(manifest) : null
+      const drift = !manifest || stateSig !== manifestSig
+      const changed =
+        drift !== (state.decomposition_drift === true) ||
+        (drift && !state.decomposition_error) ||
+        (!drift && state.decomposition_digest == null)
+      if (changed) {
+        state.decomposition_drift = drift
+        state.decomposition_error = drift
+          ? (manifest
+              ? "decomposition.json changed since ingest; call design_decompose to re-ingest"
+              : "decomposition.json is missing or unreadable; call design_decompose to re-ingest")
+          : null
+        if (!drift && state.decomposition_digest == null) state.decomposition_digest = manifestSig
+        await saveState(dir, state)
+      }
+      return state
+    }
+
+    if (state.phase !== "awaiting_decomposition") return state
     const { problems } = manifest ? validateDecomposition(state, slug, manifest) : { problems: ["the Architect has not written decomposition.json"] }
     const ready = !!manifest && problems.length === 0
     if (ready !== (state.decomposition_ready === true) || JSON.stringify(problems) !== JSON.stringify(state.decomposition_error || null)) {
@@ -847,6 +905,9 @@ async function ingestDecomposition(dir: string, slug: string, state: any, manife
   state.traceability = mergeTraceability(existing ? state.traceability || [] : [], manifest.traceability || [])
   // A re-ingest of the same version replaces the declared interfaces.
   state.interfaces = Array.isArray(manifest.interfaces) ? manifest.interfaces : []
+  state.decomposition_digest = decompositionSignature(manifest)
+  state.decomposition_drift = false
+  state.decomposition_error = null
   // A configured max_parallel must survive a manifest that omits it.
   if (manifest.max_parallel != null) state.max_parallel = Number(manifest.max_parallel)
   state.children = await buildChildren(dir, state)
@@ -2329,7 +2390,7 @@ const DESIGN_DISPATCH = tool({
 })
 
 const DESIGN_DECOMPOSE = tool({
-  description: "Referee-only: ingest a decomposition manifest, validate it, and create the subsystem runs (decompose roots only).",
+  description: "Referee-only: ingest or re-ingest a decomposition manifest, validate it, and create/reconcile the subsystem runs (decompose roots only; an established root may be re-ingested after the manifest changes, including when terminal).",
   args: {
     slug: z.string().optional(),
     decomposition_json: z.string().optional().describe("The decomposition manifest as JSON. Omit to ingest the run's decomposition.json (written by the Architect)."),
@@ -2341,8 +2402,12 @@ const DESIGN_DECOMPOSE = tool({
       ctx.sessionID,
       async (slug, state) => {
         if (!state.decompose) return JSON.stringify({ ok: false, error: "Run is not a root; start it with design_start({decompose:true})." }, null, 2)
-        if (TERMINAL.has(state.phase)) return JSON.stringify({ ok: false, error: `Run is terminal (${state.phase}); decomposition is closed.` }, null, 2)
         const existing = (state.subsystems || []).length > 0
+        // An accepted root may be re-ingested to repair a manifest that was amended
+        // after its last ingest. Stopped/blocked/failed roots stay closed.
+        if (TERMINAL.has(state.phase) && !isAcceptedTerminal(state.phase)) {
+          return JSON.stringify({ ok: false, error: `Run is terminal (${state.phase}); decomposition is closed.` }, null, 2)
+        }
         if (!existing && state.phase !== "awaiting_decomposition") {
           return JSON.stringify({ ok: false, error: "design_decompose requires the decomposition hold (awaiting_decomposition)." }, null, 2)
         }
@@ -2360,7 +2425,8 @@ const DESIGN_DECOMPOSE = tool({
         const { problems } = validateDecomposition(state, slug, manifest)
         if (problems.length) return JSON.stringify({ ok: false, problems }, null, 2)
         const subs = await ingestDecomposition(ctx.directory, slug, state, manifest, existing)
-        await pumpChildren(ctx.directory, slug)
+        if (TERMINAL.has(state.phase)) await finalizeTerminal(ctx.directory, state)
+        else await pumpChildren(ctx.directory, slug)
         const after = await readState(ctx.directory, slug)
         return JSON.stringify(
           { ok: true, subsystems: subs.map((s: any) => s.slug), traceability_gaps: after ? traceabilityGaps(after) : [], status: after ? summarize(after) : summarize(state) },
