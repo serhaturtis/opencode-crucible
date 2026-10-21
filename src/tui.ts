@@ -1,11 +1,28 @@
 import type { Plugin } from "@opencode/plugin/tui"
 import { createElement, insert, setProp } from "@opentui/solid"
-import { createSignal, onCleanup } from "solid-js"
+import { createEffect, createSignal, onCleanup } from "solid-js"
 import { readFileSync, readdirSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
+import {
+  TERMINAL,
+  currentEffort,
+  displayName,
+  effortLead,
+  groupEfforts,
+  inactivityWindow,
+  isVisible,
+  needsYou,
+  partitionEfforts,
+  sortEfforts,
+  subsystemCounts,
+  type Effort,
+  type Run,
+  type Visibility,
+} from "./tui-runs.ts"
 
-// Crucible TUI status panel: lists this worktree's runs and marks the session's current one.
+// Crucible TUI status panel: groups this worktree's runs by design, marks the session's
+// current one, and manages show/hide preferences that never touch the design files.
 
 type Child = string | number | boolean | null | undefined | object | (() => Child)
 
@@ -94,8 +111,6 @@ function registryDirs(sessionID: string) {
   }
 }
 
-type Run = { slug: string; state: any; mtime: number }
-
 function runs(directory: string): Run[] {
   const out: Run[] = []
   for (const root of designRoots(directory)) {
@@ -120,14 +135,6 @@ function runs(directory: string): Run[] {
 }
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-const TERMINAL = new Set([
-  "converged",
-  "accepted_with_reservations",
-  "budget_stopped",
-  "no_progress",
-  "stopped",
-  "blocked",
-])
 // A dispatched turn with no activity longer than the run's watchdog window is shown as stalled.
 const STALL_MS = (() => {
   const n = Number(process.env.CRUCIBLE_WATCHDOG_MS)
@@ -136,15 +143,6 @@ const STALL_MS = (() => {
 
 type Activity = { icon: string; label: string }
 
-function escalations(s: any): any[] {
-  if (Array.isArray(s.escalations) && s.escalations.length) return s.escalations
-  return s.escalation ? [s.escalation] : []
-}
-
-function needsYou(s: any): boolean {
-  return escalations(s).some((e: any) => e?.status === "pending_user_ratification")
-}
-
 // Liveness of a run: is an agent actually working, stalled, waiting, or done?
 function activity(s: any, frame: string): Activity {
   if (TERMINAL.has(s.phase)) return { icon: "■", label: s.phase }
@@ -152,8 +150,9 @@ function activity(s: any, frame: string): Activity {
   if (needsYou(s)) return { icon: "!", label: "needs you" }
   const d = s.dispatch
   if (d) {
-    // The plugin persists a coarse heartbeat while the turn streams, so an active turn is not stalled.
-    const window = Number(s.watchdog_ms) > 0 ? Number(s.watchdog_ms) : STALL_MS
+    // The plugin persists a coarse heartbeat while the turn streams and the larger window
+    // it is actually using while a tool runs, so an active turn is not shown as stalled.
+    const window = inactivityWindow(s, STALL_MS)
     const lastSign = Date.parse(d.last_activity_at || "") || Date.parse(d.started_at || "") || Date.parse(s.updated_at || "") || 0
     if (lastSign && Date.now() - lastSign > window) return { icon: "⚠", label: `${d.role} stalled` }
     const retry = Number(d.retries) > 0 ? ` (retry ${d.retries})` : ""
@@ -188,43 +187,56 @@ function summary(run: Run, frame: string) {
   }
 }
 
-function Sidebar(context: any, sessionID: string) {
+// Include the dirs this session is bound to, then this worktree. A slug is listed once.
+function collectRuns(directory: string, sessionID: string | undefined): Run[] {
+  const dirs = Array.from(new Set([...(sessionID ? registryDirs(sessionID) : []), directory]))
+  const bySlug = new Map<string, Run>()
+  for (const d of dirs) for (const r of runs(d)) if (!bySlug.has(r.slug)) bySlug.set(r.slug, r)
+  return [...bySlug.values()]
+}
+
+type SidebarData = {
+  cur: string | null
+  currentRoot: string | null
+  efforts: Effort[]
+  more: number
+  hidden: number
+}
+
+const MAX_EFFORTS = 3
+const MAX_LINES = 10
+
+function Sidebar(context: any, sessionID: string, visibility: any) {
   const theme = context.theme
   const directory = context.location?.directory || process.cwd()
+  const prefs = () => (visibility?.[directory] || {}) as Visibility
 
   // File reads happen on the slow poll; the spinner runs off its own fast tick.
-  const refresh = () => {
+  const refresh = (): SidebarData => {
     try {
       const cur = currentSlug(directory, sessionID)
-      // Include the dirs this session is bound to, bound dirs first.
-      const dirs = Array.from(new Set([...registryDirs(sessionID), directory]))
-      const bySlug = new Map<string, Run>()
-      for (const d of dirs) for (const r of runs(d)) if (!bySlug.has(r.slug)) bySlug.set(r.slug, r)
-      const sorted = [...bySlug.values()].sort((a, b) => {
-        const ar = a.state.parent_slug || a.slug
-        const br = b.state.parent_slug || b.slug
-        if (ar !== br) return ar < br ? -1 : 1
-        if (a.slug === ar && b.slug !== br) return -1
-        if (b.slug === br && a.slug !== ar) return 1
-        return b.mtime - a.mtime
-      })
-      const window = sorted.slice(0, 6)
-      // Keep the current run visible even if more than 6 runs push it out.
-      if (cur && !window.some((r) => r.slug === cur)) {
-        const curRun = sorted.find((r) => r.slug === cur)
-        if (curRun) {
-          if (window.length) window[window.length - 1] = curRun
-          else window.push(curRun)
-        }
+      const efforts = groupEfforts(collectRuns(directory, sessionID))
+      const { visible, hidden } = partitionEfforts(efforts, cur, prefs())
+      const shown = visible.slice(0, MAX_EFFORTS)
+      return {
+        cur,
+        currentRoot: currentEffort(efforts, cur)?.root ?? null,
+        efforts: shown,
+        more: visible.length - shown.length,
+        hidden,
       }
-      return { cur, all: window }
     } catch {
-      return { cur: null as string | null, all: [] as Run[] }
+      return { cur: null, currentRoot: null, efforts: [], more: 0, hidden: 0 }
     }
   }
 
   const [data, setData] = createSignal(refresh())
   const [spin, setSpin] = createSignal(0)
+  createEffect(() => {
+    // Repaint as soon as this worktree's show/hide preferences change.
+    void visibility?.[directory]
+    setData(refresh())
+  })
   const poll = setInterval(() => setData(refresh()), 2000)
   const anim = setInterval(() => setSpin((v) => v + 1), 120)
   onCleanup(() => {
@@ -233,33 +245,145 @@ function Sidebar(context: any, sessionID: string) {
   })
   const frame = () => SPINNER[spin() % SPINNER.length]
 
-  const children: Child[] = [text({ fg: theme.text.base }, ["Crucible"])]
-  for (let i = 0; i < 6; i++) {
-    children.push(
-      text({ fg: theme.text.muted }, [
-        () => {
-          const d = data()
-          const r = d.all[i]
-          if (!r) return ""
-          const indent = r.state.parent_slug ? "  └ " : "  "
-          const marker = r.slug === d.cur ? "▸ " : indent
-          const need = needsYou(r.state) ? "! " : ""
-          return `${marker}${need}${r.slug} · ${summary(r, frame()).head}`
-        },
-      ]),
-    )
-    children.push(
-      text({ fg: theme.text.muted }, [
-        () => {
-          const d = data()
-          const r = d.all[i]
-          if (!r || r.slug !== d.cur) return ""
-          return `   ${summary(r, frame()).detail}`
-        },
-      ]),
-    )
+  // One effort per design. The current effort gets a compact status line and a
+  // metrics line; other efforts get one status line. The sidebar is narrow, so
+  // every line is single-line/truncated and names are shortened before display.
+  const lines = () => {
+    const d = data()
+    const f = frame()
+    const out: string[] = []
+    for (const effort of d.efforts) {
+      const lead = effortLead(effort)
+      const current = d.cur ? effort.runs.find((r) => r.slug === d.cur) : undefined
+      const need = effort.runs.some((r) => needsYou(r.state)) ? "! " : ""
+      const marker = effort.root === d.currentRoot ? "▸ " : "  "
+      const who = current && current.slug !== effort.root ? ` › ${displayName(current.slug)}` : ""
+      out.push(`${marker}${need}${displayName(effort.root)}${who}`)
+      if (current) {
+        const a = activity(current.state, f)
+        const phase = String(current.state.phase || "?")
+        const status = a.label === phase ? phase : `${phase} · ${a.label}`
+        const last = Array.isArray(current.state.history) ? current.state.history.at(-1) : undefined
+        const base = Number(current.state.integration_base_round) > 0 ? Number(current.state.integration_base_round) : 0
+        const budget = `${base ? "int " : ""}${(current.state.round ?? 0) - base}/${current.state.budgets?.max_rounds ?? "?"}`
+        const open = (Array.isArray(current.state.open_findings) ? current.state.open_findings : []).filter(
+          (x: any) => !["resolved", "accepted_risk"].includes(x?.status),
+        ).length
+        const gate = (Array.isArray(current.state.open_findings) ? current.state.open_findings : []).filter(
+          (x: any) => gating(x) && !["resolved", "accepted_risk"].includes(x?.status),
+        ).length
+        const metrics = [
+          `${current.state.budgets?.mode ?? "?"} ${budget}`,
+          open ? `${open} open` : "0 open",
+          gate ? `${gate} gate` : "0 gate",
+          last ? `score ${last.score}` : "",
+        ].filter(Boolean).join(" · ")
+        out.push(`  ${status}`)
+        out.push(`  ${metrics}`)
+      } else {
+        const a = activity(lead.state, f)
+        const phase = String(lead.state.phase || "?")
+        const status = a.label === phase ? phase : `${phase} · ${a.label}`
+        const from = lead.slug !== effort.root ? `${displayName(lead.slug)} · ` : ""
+        out.push(`  ${from}${status}`)
+      }
+    }
+    const foot = [d.more > 0 ? `+${d.more} more` : "", d.hidden > 0 ? `${d.hidden} hidden` : ""].filter(Boolean)
+    out.push(`  /crucible${foot.length ? ` · ${foot.join(" · ")}` : ""}`)
+    return out
+  }
+
+  const lineProps = { fg: theme.text.muted, wrapMode: "none" as const, truncate: true }
+  const children: Child[] = [text({ fg: theme.text.base, wrapMode: "none" as const, truncate: true }, ["Crucible"])]
+  for (let i = 0; i < MAX_LINES; i++) {
+    children.push(text(lineProps, [() => lines()[i] ?? ""]))
   }
   return box({ flexDirection: "column" }, children)
+}
+
+// The show/hide manager. Visibility is TUI state only; selecting an option never
+// deletes or moves a design directory.
+async function manageDesigns(context: any, visibility: any, save: (mutation: (draft: any) => void) => Promise<void>) {
+  const directory = context.location?.directory || process.cwd()
+  const route = (() => {
+    try {
+      return context.ui.router.current()
+    } catch {
+      return null
+    }
+  })()
+  const sessionID = route?.type === "session" ? route.sessionID : undefined
+  const SHOW_ALL = "\u0000show-all"
+
+  for (;;) {
+    const runList = collectRuns(directory, sessionID)
+    if (!runList.length) {
+      context.ui.toast.show({ title: "Crucible", message: "No designs in this worktree", variant: "info" })
+      return
+    }
+    const cur = currentSlug(directory, sessionID)
+    const efforts = sortEfforts(groupEfforts(runList), cur)
+    const prefs = (visibility?.[directory] || {}) as Visibility
+    const shown = new Map(efforts.map((effort) => [effort.root, isVisible(effort, cur, prefs)]))
+    const hidden = efforts.filter((effort) => !shown.get(effort.root)).length
+    const current = currentEffort(efforts, cur)?.root
+    const options: Array<{ title: string; value: string; description: string; footer?: string; category: string }> = efforts.map((effort) => {
+      const visible = shown.get(effort.root) === true
+      const subs = subsystemCounts(effort)
+      return {
+        title: `${visible ? "●" : "○"} ${effort.root}`,
+        value: effort.root,
+        description: `${summary(effortLead(effort), "·").head}${subs.total ? ` · ${subs.live}/${subs.total} subs live` : ""}`,
+        footer: visible ? undefined : "hidden — design files kept",
+        category: effort.root === current && visible ? "Current" : visible ? "Shown" : "Hidden",
+      }
+    })
+    if (hidden) {
+      options.push({
+        title: "Show all hidden designs",
+        value: SHOW_ALL,
+        description: `${hidden} hidden · design files stay on disk`,
+        category: "Actions",
+      })
+    }
+
+    let choice: string | undefined
+    try {
+      choice = await context.ui.dialog.select({
+        title: "Crucible designs",
+        placeholder: "Show or hide in the sidebar — design files stay on disk",
+        options,
+        current,
+      })
+    } catch {
+      return
+    }
+    if (!choice) return
+
+    try {
+      if (choice === SHOW_ALL) {
+        await save((draft) => {
+          const own = draft[directory] || (draft[directory] = {})
+          for (const effort of efforts) if (!shown.get(effort.root)) own[effort.root] = "show"
+        })
+        continue
+      }
+      const visible = shown.get(choice)
+      if (visible === undefined) continue
+      const next = visible ? "hide" : "show"
+      await save((draft) => {
+        const own = draft[directory] || (draft[directory] = {})
+        own[choice] = next
+      })
+      context.ui.toast.show({
+        title: "Crucible",
+        message: `${next === "hide" ? "Hidden" : "Shown"} ${choice} · design files kept`,
+        duration: 2000,
+      })
+    } catch {
+      return
+    }
+  }
 }
 
 // Every server notice for this worktree becomes a toast. V2 has no server-side toast API,
@@ -291,10 +415,56 @@ const plugin = {
   id: "opencode-crucible.tui",
   setup(context: Plugin.Context) {
     const disposers: Array<() => void> = []
+    // Durable TUI-only state, keyed by worktree. Design files are never touched.
+    let visibility: any = {}
+    let saveVisibility: ((mutation: (draft: any) => void) => Promise<void>) | undefined
     try {
-      disposers.push(context.ui.slot({ append: "sidebar.content", render: ({ sessionID }) => Sidebar(context, sessionID) }))
+      if (context.storage?.store) {
+        const [store, save] = context.storage.store<Record<string, Visibility>>("crucible.visibility", { initial: {} })
+        visibility = store
+        saveVisibility = save
+      }
+    } catch {
+      // no durable storage: the sidebar still works with automatic visibility
+    }
+    try {
+      disposers.push(context.ui.slot({ append: "sidebar.content", render: ({ sessionID }) => Sidebar(context, sessionID, visibility) }))
     } catch {
       // sidebar is best-effort; never break the TUI
+    }
+    if (saveVisibility) {
+      const save = saveVisibility
+      try {
+        // keymap.layer needs a Solid component owner, so the layer lives in an app slot.
+        disposers.push(
+          context.ui.slot({
+            append: "app",
+            render: () => {
+              context.keymap.layer(() => ({
+                mode: "global",
+                commands: [
+                  {
+                    id: "crucible.designs",
+                    title: "Crucible designs",
+                    description: "Show or hide designs in the sidebar (design files are kept)",
+                    group: "Crucible",
+                    palette: true,
+                    slash: { name: "crucible" },
+                    run: () => {
+                      void manageDesigns(context, visibility, save).catch((error) => {
+                        context.ui.toast.show({ title: "Crucible", message: String(error?.message || error), variant: "error", duration: 4000 })
+                      })
+                    },
+                  },
+                ],
+              }))
+              return null as any
+            },
+          }),
+        )
+      } catch {
+        // command registration is best-effort
+      }
     }
     const stopNotices = watchNotifications(context)
     return () => {

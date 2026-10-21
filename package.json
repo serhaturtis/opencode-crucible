@@ -19,7 +19,8 @@
     "dist",
     "server.ts",
     "tui.ts",
-    "src/tui.ts"
+    "src/tui.ts",
+    "src/tui-runs.ts"
   ],
   "scripts": {
     "build": "bun build ./src/server.ts --outdir ./dist --target bun --external @opencode/plugin --external zod --entry-naming server.js",
