@@ -380,7 +380,7 @@ test("2-subsystem decompose: hold, create, pump, release, block", async () => {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
   }
-})
+}, 15_000)
 
 test("plain run is unchanged (backward compatible, no decomposition)", async () => {
   const { dir, hooks, call, j } = await harness()

@@ -171,7 +171,7 @@ export function evidenceProblem(rec: any): string | null {
 // A cited artifact that is internally contradictory is not usable even when its class is
 // strong. A finding may not cite an artifact recorded by the party whose work it attacks:
 // that is self-attestation, not independent review (the audit's C-04 class).
-export function unbackedReason(state: any, ev: any, opts?: { independentOf?: string }): string | null {
+export function unbackedReason(state: any, ev: any, opts?: { independentOf?: string; round?: number }): string | null {
   const aid = ev?.artifact_id
   const rec = aid ? (state?.evidence || []).find((e: any) => e.id === aid) : null
   if (rec) {
@@ -180,6 +180,9 @@ export function unbackedReason(state: any, ev: any, opts?: { independentOf?: str
     const recorder = rec.recorded_by
     if (opts?.independentOf && recorder && recorder !== opts.independentOf && recorder !== "referee") {
       return `${aid} was recorded by the ${recorder}, not independently by the ${opts.independentOf}`
+    }
+    if (opts?.round != null && Number.isFinite(rec.round) && rec.round < opts.round) {
+      return `${aid} was recorded in round ${rec.round}; a binding finding needs evidence recorded this round (${opts.round})`
     }
   }
   if (ev?.class !== "executable" && ev?.class !== "model_checked") return null
@@ -698,8 +701,9 @@ export const FINDING_ACTIONS = new Set(["open", "needs_adjudication"])
 // Downgrade executable/model_checked claims with no strong recorded artifact to hypotheses.
 export function downgradeUnbackedEvidence(state: any, verdict: any) {
   for (const f of verdict?.findings || []) {
-    // Findings are the Falsifier's; the Architect cannot supply their gate evidence.
-    const why = unbackedReason(state, f?.evidence, { independentOf: "falsifier" })
+    // Findings are the Falsifier's; the Architect cannot supply their gate evidence, and
+    // an artifact from an earlier revision cannot bind the current one.
+    const why = unbackedReason(state, f?.evidence, { independentOf: "falsifier", round: state.round })
     if (!why) continue
     f.evidence.verification = "hypothesis"
     f.evidence.note = `downgraded: ${why}`

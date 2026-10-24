@@ -1430,11 +1430,19 @@ describe("unbackedReason", () => {
     expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" }, { independentOf: "falsifier" })).toBeNull()
     s.evidence[0].recorded_by = "referee"
     expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" }, { independentOf: "falsifier" })).toBeNull()
+    // An artifact from an earlier revision is stale, even when its class and recorder are fine.
+    s.evidence.push({ id: "E-002", class: "executable", recorded_by: "falsifier", round: 1, command: "check.sh", exit_code: 0, output_preview: "ok" })
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-002" }, { independentOf: "falsifier", round: 3 })).toContain("recorded in round 1")
     s.evidence[0].recorded_by = "architect"
     const v = { findings: [{ id: "F-001", evidence: { class: "executable", verification: "verified", artifact_id: "E-001" } }] }
     downgradeUnbackedEvidence(s, v)
     expect(v.findings[0].evidence.verification).toBe("hypothesis")
     expect(v.findings[0].evidence.note).toContain("not independently")
+    s.round = 3
+    const stale = { findings: [{ id: "F-002", evidence: { class: "executable", verification: "verified", artifact_id: "E-002" } }] }
+    downgradeUnbackedEvidence(s, stale)
+    expect(stale.findings[0].evidence.verification).toBe("hypothesis")
+    expect(stale.findings[0].evidence.note).toContain("recorded in round 1")
   })
 })
 
