@@ -198,7 +198,10 @@ command that agent actually ran in the current turn: run it with the shell tool,
 then call \`design_record_evidence\` with the same \`command\`; the plugin records
 the captured output and exit code and ignores typed-in ones. Evidence recorded by
 the Referee or user is taken as given. Each record also carries the workspace
-\`commit\`, the \`tag\` when the commit is tagged, and the role that recorded it.
+\`commit\`, \`base_commit\`, branch and dirty state, an exact \`tag\` when the clean
+commit is tagged (otherwise the \`working-tree\` marker), the command's
+\`script_digest\`/\`script_path\` when it names a script, the tool
+\`environment\`, and the role that recorded it.
 A finding may not cite an artifact the Architect recorded itself (self-attestation),
 and a binding finding must cite an artifact recorded in the current round: stale or
 self-recorded evidence is downgraded to \`hypothesis\`, so the Falsifier records its

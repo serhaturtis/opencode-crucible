@@ -5,6 +5,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import {
   SCHEMA_VERSION,
   REQUIRED_DIMENSIONS,
@@ -537,21 +538,93 @@ function shellResult(result: any): { output: string; exit: number | null } {
   return { output: content, exit: exitOf(result?.metadata) }
 }
 
-// Best-effort git identity for an evidence record. Never fails the record; a missing
-// repository or git binary just leaves the fields null.
-function gitRevision(dir: string): { commit: string | null; tag: string | null } {
+function sha256(value: string | Buffer) {
+  return createHash("sha256").update(value).digest("hex")
+}
+
+// Best-effort git identity for an evidence record. A dirty tree is not the tagged
+// commit, so its tag is the explicit `working-tree` marker (with branch/base SHA)
+// rather than an exact-match tag. Never fails the record: outside a repository all
+// fields are null.
+type GitState = {
+  commit: string | null
+  base_commit: string | null
+  tag: string | null
+  branch: string | null
+  dirty: boolean | null
+}
+
+function gitState(dir: string): GitState {
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()
   try {
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()
-    let tag: string | null = null
+    const commit = git("rev-parse", "HEAD") || null
+    const branch = git("rev-parse", "--abbrev-ref", "HEAD") || null
+    let dirty: boolean | null = null
     try {
-      tag = execFileSync("git", ["describe", "--tags", "--exact-match"], { cwd: dir, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim() || null
+      dirty = git("status", "--porcelain") !== ""
     } catch {
-      tag = null
+      dirty = null
     }
-    return { commit: commit || null, tag }
+    let tag: string | null = null
+    if (commit && dirty === false) {
+      try {
+        tag = git("describe", "--tags", "--exact-match") || null
+      } catch {
+        tag = null
+      }
+    }
+    return { commit, base_commit: commit, tag: tag || (commit ? "working-tree" : null), branch, dirty }
   } catch {
-    return { commit: null, tag: null }
+    return { commit: null, base_commit: null, tag: null, branch: null, dirty: null }
   }
+}
+
+// The script an evidence command names, hashed from its bytes; inline commands are
+// hashed as text. This makes an executable record reproducible after the run.
+function scriptInfo(dir: string, command: string | undefined): { script_digest: string | null; script_path: string | null } {
+  if (!command) return { script_digest: null, script_path: null }
+  // Follow the common `cd <dir> && python3 script.py` shape so the digest names the
+  // script, not just the wrapper command. Quotes are accepted around the directory.
+  const cd = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/.exec(command)
+  const base = cd ? path.resolve(dir, cd[1] || cd[2] || cd[3]) : dir
+  const match = /([A-Za-z0-9_./-]+\.(?:py|sh|mjs|js|ts))/.exec(command)
+  if (match) {
+    const file = path.isAbsolute(match[1]) ? match[1] : path.resolve(base, match[1])
+    try {
+      const bytes = readFileSync(file)
+      const relative = path.relative(dir, file)
+      const shown = relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : file
+      return { script_digest: sha256(bytes), script_path: shown }
+    } catch {
+      // A missing script path falls back to hashing the command itself.
+    }
+  }
+  return { script_digest: sha256(command), script_path: "inline" }
+}
+
+let environmentCache: Record<string, string> | null = null
+
+function environmentInfo(): Record<string, string> {
+  if (environmentCache) return environmentCache
+  const arch = os.arch() === "x64" ? "x86_64" : os.arch() === "arm64" ? "aarch64" : os.arch()
+  const env: Record<string, string> = {
+    os: os.type(),
+    arch,
+    node: process.version,
+  }
+  if (process.versions.bun) env.bun = process.versions.bun
+  for (const tool of ["rustc", "cargo"]) {
+    try {
+      const out = execFileSync(tool, ["--version"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()
+      // "rustc 1.99.1 (hash date)" -> "1.99.1"; keep the full line if it is not that shape.
+      env[tool] = out.split(/\s+/)[1] || out
+    } catch {
+      // Tool absent: omit it rather than inventing a version.
+    }
+  }
+  environmentCache = env
+  return env
 }
 
 async function callerRun(dir: string, sessionID: string | undefined) {
@@ -2247,7 +2320,8 @@ const DESIGN_RECORD_EVIDENCE = tool({
         if (!output?.trim()) return JSON.stringify({ ok: false, error: "output is required (nothing was captured for this evidence)." }, null, 2)
         const id = nextId(state, "E-", state.evidence)
         const output_preview = String(output).slice(0, 2000)
-        const revision = gitRevision(ctx.directory)
+        const revision = gitState(ctx.directory)
+        const script = scriptInfo(ctx.directory, command)
         const suspect = evidenceProblem({ command, exit_code: exit_code ?? null, output_preview })
         // Who recorded it matters: a finding cannot be backed by an artifact the reviewed
         // party recorded itself. The Referee session is the user side of the run.
@@ -2264,7 +2338,13 @@ const DESIGN_RECORD_EVIDENCE = tool({
           round: state.round,
           at: nowIso(),
           commit: revision.commit,
+          base_commit: revision.base_commit,
           tag: revision.tag,
+          branch: revision.branch,
+          dirty: revision.dirty,
+          script_digest: script.script_digest,
+          script_path: script.script_path,
+          environment: environmentInfo(),
           suspect,
           recorded_by: recorder,
           recorded_session: ctx.sessionID || null,
@@ -2272,7 +2352,25 @@ const DESIGN_RECORD_EVIDENCE = tool({
         state.evidence.push(rec)
         await writeJsonAtomic(path.join(designDir(ctx.directory, slug), ".crucible", "evidence", `${id}.json`), { ...rec, output })
         await saveState(ctx.directory, state)
-        return JSON.stringify({ ok: true, id, captured, digest: rec.digest, commit: rec.commit, tag: rec.tag, suspect, status: summarize(state) }, null, 2)
+        return JSON.stringify(
+          {
+            ok: true,
+            id,
+            captured,
+            digest: rec.digest,
+            commit: rec.commit,
+            base_commit: rec.base_commit,
+            tag: rec.tag,
+            branch: rec.branch,
+            dirty: rec.dirty,
+            script_digest: rec.script_digest,
+            script_path: rec.script_path,
+            suspect,
+            status: summarize(state),
+          },
+          null,
+          2,
+        )
       },
       { tool: "design_record_evidence", roles: ["architect", "falsifier"] },
     )

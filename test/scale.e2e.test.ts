@@ -2,6 +2,8 @@ import { test, expect, afterAll } from "bun:test"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 
 // End-to-end plugin tests with a fake V2 plugin context and a temp worktree (no opencode, no live agents).
 const dataHome = await fs.mkdtemp(path.join(os.tmpdir(), "crucible-data-"))
@@ -1267,8 +1269,84 @@ test("a recorded artifact with a masked exit or contradictory output is flagged"
     const st = await readState(dir, "evid")
     expect(st.evidence[0].suspect).toContain("masked")
     expect(st.evidence[0].commit).toBe(null)
+    expect(st.evidence[0].base_commit).toBe(null)
+    expect(st.evidence[0].tag).toBe(null)
+    expect(st.evidence[0].branch).toBe(null)
+    expect(st.evidence[0].dirty).toBe(null)
+    expect(st.evidence[0].environment.os).toBeTruthy()
+    expect(st.evidence[0].script_digest).toMatch(/^[a-f0-9]{64}$/)
+    expect(st.evidence[0].script_path).toBe("inline")
     expect(st.evidence[0].recorded_by).toBe("referee")
     expect(j(await call("design_status", { slug: "evid" })).suspect_evidence).toBe(1)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("evidence captures git state and the script digest", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await readyRun(call, "git-ev")
+    execFileSync("git", ["init", "-q"], { cwd: dir })
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir })
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: dir })
+    const script = "#!/usr/bin/env bash\necho ok\n"
+    const scriptPath = path.join(dir, "scripts", "check.sh")
+    await fs.mkdir(path.dirname(scriptPath), { recursive: true })
+    await fs.writeFile(scriptPath, script)
+    await fs.writeFile(path.join(dir, "README.md"), "base\n")
+    execFileSync("git", ["add", "."], { cwd: dir })
+    execFileSync("git", ["commit", "-qm", "base"], { cwd: dir })
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim()
+    const expected = createHash("sha256").update(script).digest("hex")
+
+    const rec = j(await call("design_record_evidence", {
+      slug: "git-ev",
+      class: "authoritative",
+      command: "cd scripts && bash check.sh",
+      output: "ok",
+      artifact_ref: "03-architecture.md#x",
+    }))
+    expect(rec.commit).toBe(head)
+    expect(rec.base_commit).toBe(head)
+    expect(rec.tag).toBe("working-tree")
+    expect(rec.branch).toBeTruthy()
+    expect(rec.dirty).toBe(false)
+    expect(rec.script_digest).toBe(expected)
+    expect(rec.script_path).toBe("scripts/check.sh")
+    const st = await readState(dir, "git-ev")
+    expect(st.evidence[0].environment.os).toBeTruthy()
+    expect(st.evidence[0].environment.arch).toBeTruthy()
+
+    // The first record's own files make the tree dirty; commit them before testing
+    // the clean-tag path.
+    execFileSync("git", ["add", "."], { cwd: dir })
+    execFileSync("git", ["commit", "-qm", "evidence 1"], { cwd: dir })
+    await fs.writeFile(path.join(dir, "README.md"), "dirty\n")
+    const dirty = j(await call("design_record_evidence", {
+      slug: "git-ev",
+      class: "authoritative",
+      command: "bash scripts/check.sh",
+      output: "ok2",
+      artifact_ref: "03-architecture.md#x",
+    }))
+    expect(dirty.dirty).toBe(true)
+    expect(dirty.tag).toBe("working-tree")
+
+    execFileSync("git", ["checkout", "--", "README.md"], { cwd: dir })
+    execFileSync("git", ["add", "."], { cwd: dir })
+    execFileSync("git", ["commit", "-qm", "evidence 2"], { cwd: dir })
+    execFileSync("git", ["tag", "v-test"], { cwd: dir })
+    const tagged = j(await call("design_record_evidence", {
+      slug: "git-ev",
+      class: "authoritative",
+      command: "bash scripts/check.sh",
+      output: "ok3",
+      artifact_ref: "03-architecture.md#x",
+    }))
+    expect(tagged.dirty).toBe(false)
+    expect(tagged.tag).toBe("v-test")
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })

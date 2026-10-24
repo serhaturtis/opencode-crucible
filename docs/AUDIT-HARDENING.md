@@ -13,7 +13,7 @@ Those classes are now invariants here.
 | --- | --- | --- | --- |
 | C-04, H-10: gate evidence had no producer/independence check | The Architect's own artifact could back the Falsifier's finding | `design_record_evidence` stores `recorded_by`; a finding citing an Architect-recorded strong artifact is downgraded to `hypothesis` | `test/core.test.ts` ("a Falsifier finding cannot be backed by the Architect's own evidence") |
 | C-02, H-10: gate evidence could cite a pre-change artifact | A finding could bind the current revision with evidence gathered against an older one | A binding finding's artifact must have been recorded in the current round; an older `round` is downgraded with the reason | same test (stale round assertion) |
-| M-23: evidence was not bound to a commit/tag | A design verdict could cite output from an unrelated tree state | Evidence records carry `commit` and exact-match `tag` (best effort; null outside git) | `test/scale.e2e.test.ts` ("a recorded artifact with a masked exit or contradictory output is flagged") |
+| M-23: evidence was not bound to a commit/tag | A design verdict could cite output from an unrelated tree state | Evidence records carry `commit`, `base_commit`, `branch`, `dirty`, an exact-match `tag` only when the clean commit is tagged (otherwise `working-tree`), the command's `script_digest`/`script_path`, and the tool `environment` | `test/scale.e2e.test.ts` ("evidence captures git state and script digest") |
 | L-02: an exit-0 record contained `[FAIL]` / `SOME CHECKS FAILED` | A masked exit or contradictory artifact could gate convergence | `evidenceProblem` marks the record `suspect`; `unbackedReason` refuses it | `test/core.test.ts` ("a contradictory or masked-exit artifact cannot back a claim") |
 | H-13, M-24: a ratified/accepted issue was not carried into the parent ledger | A root looked clean while a subsystem carried an accepted risk or open finding | The root's child summary carries `risks` and unresolved `findings`; `08-open-issues.md` renders both with the subsystem id | `test/core.test.ts` ("carries a child's accepted risk and open findings into the root ledger"), `test/scale.e2e.test.ts` ("root hand-off lists subsystem loose ends") |
 | H-04/H-11 class: cross-root state was invisible at the root | The root's hand-off omitted a subsystem's loose ends | `subsystem_loose_ends` continues to include both unresolved and accepted child findings; the hand-off now also has the structured child summary | same hand-off test |
@@ -29,6 +29,10 @@ Those classes are now invariants here.
 - **Evidence provenance** is local-trust metadata, not authentication. The workspace
   is single-user and has no token/principal layer; `recorded_by` is the role the
   plugin resolved from the managed session.
+- **Working-tree evidence** is tagged `working-tree` with its branch, base commit and
+  `dirty` flag; only a clean exact-tag commit records the tag itself. `script_digest`
+  hashes the script file named by the command (including a simple
+  `cd <dir> && ...`), or the command text when the script is inline.
 - **Legacy records** without `recorded_by` are accepted as-is. The stricter check
   applies only to records that carry a role, so existing v0.1 run state remains
   readable.
