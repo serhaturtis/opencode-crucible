@@ -177,12 +177,15 @@ export function unbackedReason(state: any, ev: any, opts?: { independentOf?: str
   if (rec) {
     const problem = evidenceProblem(rec)
     if (problem) return `${aid}: ${problem}`
-    const recorder = rec.recorded_by
-    if (opts?.independentOf && recorder && recorder !== opts.independentOf && recorder !== "referee") {
-      return `${aid} was recorded by the ${recorder}, not independently by the ${opts.independentOf}`
-    }
-    if (opts?.round != null && Number.isFinite(rec.round) && rec.round < opts.round) {
-      return `${aid} was recorded in round ${rec.round}; a binding finding needs evidence recorded this round (${opts.round})`
+    // Independence and freshness matter only for the strong classes that can bind.
+    if (STRONG_EVIDENCE.has(ev?.class)) {
+      const recorder = rec.recorded_by
+      if (opts?.independentOf && recorder && recorder !== opts.independentOf && recorder !== "referee") {
+        return `${aid} was recorded by the ${recorder}, not independently by the ${opts.independentOf}`
+      }
+      if (opts?.round != null && Number.isFinite(rec.round) && rec.round < opts.round) {
+        return `${aid} was recorded in round ${rec.round}; a binding finding needs evidence recorded this round (${opts.round})`
+      }
     }
   }
   if (ev?.class !== "executable" && ev?.class !== "model_checked") return null

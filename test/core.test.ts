@@ -1433,6 +1433,8 @@ describe("unbackedReason", () => {
     // An artifact from an earlier revision is stale, even when its class and recorder are fine.
     s.evidence.push({ id: "E-002", class: "executable", recorded_by: "falsifier", round: 1, command: "check.sh", exit_code: 0, output_preview: "ok" })
     expect(unbackedReason(s, { class: "executable", artifact_id: "E-002" }, { independentOf: "falsifier", round: 3 })).toContain("recorded in round 1")
+    // Weak classes are not held to the strong-class provenance rule.
+    expect(unbackedReason(s, { class: "structured_argument", artifact_id: "E-002" }, { independentOf: "falsifier", round: 3 })).toBeNull()
     s.evidence[0].recorded_by = "architect"
     const v = { findings: [{ id: "F-001", evidence: { class: "executable", verification: "verified", artifact_id: "E-001" } }] }
     downgradeUnbackedEvidence(s, v)
