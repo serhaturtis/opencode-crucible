@@ -45,6 +45,7 @@ import {
   openGate,
   boardClean,
   unbackedReason,
+  evidenceProblem,
   nextFindingId,
   mergeRisks,
   looseEnds,
@@ -1311,6 +1312,18 @@ describe("open issues report", () => {
     expect(md).toContain("| F-1 | blocker | security | wont_fix | unsafe default |")
     expect(md).toContain("needs_adjudication (contested)")
   })
+
+  test("carries a child's accepted risk and open findings into the root ledger", () => {
+    const s = newState("root", "Root", "sess-1")
+    s.children = [{
+      slug: "root--bind",
+      risks: [{ id: "F-008", severity: "minor", category: "data", accepted_by: "accept_risk", claim: "S-B04 asserted", subsystem: "BIND" }],
+      findings: [{ id: "F-009", severity: "major", category: "reliability", status: "binding", claim: "loses a write", subsystem: "BIND" }],
+    }]
+    const md = renderOpenIssues(s)
+    expect(md).toContain("| F-008 (BIND) | minor | data | accept_risk | S-B04 asserted |")
+    expect(md).toContain("| F-009 (BIND) | major | reliability | binding | loses a write |")
+  })
 })
 
 describe("verdict and response validation", () => {
@@ -1399,7 +1412,32 @@ describe("unbackedReason", () => {
     expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" })).toBeNull()
     expect(unbackedReason(s, { class: "executable", artifact_id: "E-002" })).toContain("belief")
   })
+
+  test("a contradictory or masked-exit artifact cannot back a claim", () => {
+    expect(evidenceProblem({ command: "python3 check.py; echo exit:$?", exit_code: 0, output_preview: "SOME CHECKS FAILED" })).toContain("masked")
+    expect(evidenceProblem({ command: "false || true", exit_code: 0, output_preview: "ok" })).toContain("masks")
+    expect(evidenceProblem({ command: "cargo test", exit_code: 0, output_preview: "all tests pass" })).toBeNull()
+    const s = newState("probe", "Probe", "sess-1")
+    s.evidence.push({ id: "E-001", class: "executable", command: "check.sh; echo $?", exit_code: 0, output_preview: "SOME CHECKS FAILED" })
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" })).toContain("output reports a failure")
+  })
+
+  test("a Falsifier finding cannot be backed by the Architect's own evidence", () => {
+    const s = newState("probe", "Probe", "sess-1")
+    s.evidence.push({ id: "E-001", class: "executable", recorded_by: "architect", command: "check.sh", exit_code: 0, output_preview: "ok" })
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" }, { independentOf: "falsifier" })).toContain("recorded by the architect")
+    s.evidence[0].recorded_by = "falsifier"
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" }, { independentOf: "falsifier" })).toBeNull()
+    s.evidence[0].recorded_by = "referee"
+    expect(unbackedReason(s, { class: "executable", artifact_id: "E-001" }, { independentOf: "falsifier" })).toBeNull()
+    s.evidence[0].recorded_by = "architect"
+    const v = { findings: [{ id: "F-001", evidence: { class: "executable", verification: "verified", artifact_id: "E-001" } }] }
+    downgradeUnbackedEvidence(s, v)
+    expect(v.findings[0].evidence.verification).toBe("hypothesis")
+    expect(v.findings[0].evidence.note).toContain("not independently")
+  })
 })
+
 
 describe("rebut evidence backing", () => {
   const rebut = (artifact_id?: string) => ({

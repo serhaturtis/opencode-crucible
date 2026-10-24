@@ -132,6 +132,7 @@ export function isCited(finding: any) {
 }
 
 // A finding that holds the gate: validated binding evidence, or contested pending adjudication.
+// A weak "needs_adjudication" request is escalated/held but intentionally does not gate.
 export function isGating(f: any) {
   if (!GATE_SEVERITIES.has(f?.severity)) return false
   return f.status === "binding" || (f.status === "needs_adjudication" && f.contested === true)
@@ -152,11 +153,36 @@ export function adjudicationWhy(f: any) {
   return "rebutted without verified evidence"
 }
 
-// Why an executable/model_checked claim lacks a recorded strong artifact (null when backed or not required).
-export function unbackedReason(state: any, ev: any): string | null {
-  if (ev?.class !== "executable" && ev?.class !== "model_checked") return null
+// A recorded artifact that contradicts itself: an exit 0 with a failure in the output, or a
+// command that masks the exit status. This is the E-060 class of audit finding.
+export function evidenceProblem(rec: any): string | null {
+  const output = String(rec?.output_preview ?? rec?.output ?? "")
+  const command = String(rec?.command ?? "")
+  if (rec?.exit_code === 0 && /\[FAIL\]|SOME CHECKS FAILED|(?:^|\n)\s*FAIL(?:ED)?\b/.test(output)) {
+    return "the command exited 0 but its output reports a failure; the exit status is masked"
+  }
+  if (/(;\s*echo\b|\|\|\s*(?:true|:)\b|&&\s*true\b|;\s*exit\s+0\b)/.test(command)) {
+    return "the recorded command masks the real exit status"
+  }
+  return null
+}
+
+// Why a claim lacks a recorded strong artifact (null when backed or not required).
+// A cited artifact that is internally contradictory is not usable even when its class is
+// strong. A finding may not cite an artifact recorded by the party whose work it attacks:
+// that is self-attestation, not independent review (the audit's C-04 class).
+export function unbackedReason(state: any, ev: any, opts?: { independentOf?: string }): string | null {
   const aid = ev?.artifact_id
   const rec = aid ? (state?.evidence || []).find((e: any) => e.id === aid) : null
+  if (rec) {
+    const problem = evidenceProblem(rec)
+    if (problem) return `${aid}: ${problem}`
+    const recorder = rec.recorded_by
+    if (opts?.independentOf && recorder && recorder !== opts.independentOf && recorder !== "referee") {
+      return `${aid} was recorded by the ${recorder}, not independently by the ${opts.independentOf}`
+    }
+  }
+  if (ev?.class !== "executable" && ev?.class !== "model_checked") return null
   if (!rec) return `no recorded evidence artifact${aid ? ` for ${aid}` : ""}`
   if (!STRONG_EVIDENCE.has(rec.class)) return `${aid} is a ${rec.class || "unclassified"} record, not executable/model-checked evidence`
   return null
@@ -672,7 +698,8 @@ export const FINDING_ACTIONS = new Set(["open", "needs_adjudication"])
 // Downgrade executable/model_checked claims with no strong recorded artifact to hypotheses.
 export function downgradeUnbackedEvidence(state: any, verdict: any) {
   for (const f of verdict?.findings || []) {
-    const why = unbackedReason(state, f?.evidence)
+    // Findings are the Falsifier's; the Architect cannot supply their gate evidence.
+    const why = unbackedReason(state, f?.evidence, { independentOf: "falsifier" })
     if (!why) continue
     f.evidence.verification = "hypothesis"
     f.evidence.note = `downgraded: ${why}`
@@ -1147,12 +1174,27 @@ function cell(text: any) {
 }
 
 export function renderOpenIssues(state: any) {
+  const findingRow = (f: any) =>
+    `| ${f.id}${f.subsystem ? ` (${f.subsystem})` : ""} | ${f.severity} | ${f.category} | ${f.status}${f.contested ? " (contested)" : ""} | ${cell(f.claim).slice(0, 120)} |`
   const rows = state.open_findings
     .filter((f: any) => !["resolved", "accepted_risk"].includes(f.status))
-    .map((f: any) => `| ${f.id} | ${f.severity} | ${f.category} | ${f.status}${f.contested ? " (contested)" : ""} | ${cell(f.claim).slice(0, 120)} |`)
-  // Architect-accepted and user-ratified risks of every round are residual risks too.
-  const risks = mergeRisks(state.risks || [], state.open_findings).map(
-    (r: any) => `| ${r.id} | ${r.severity} | ${r.category} | ${r.accepted_by} | ${cell(r.claim).slice(0, 120)} |`,
+    .map(findingRow)
+  // A root's release record carries its subsystems' unresolved findings as well.
+  const childRows = (state.children || []).flatMap((c: any) => (Array.isArray(c.findings) ? c.findings : [])).map(findingRow)
+  rows.push(...childRows)
+  // Accepted risks from the root and every child are residual risks. A child's accepted
+  // risk is part of the root's release record even when the root never raised it itself.
+  // Keep the subsystem in the dedupe key: F-008 may exist in more than one child.
+  const childRisks = (state.children || []).flatMap((c: any) => Array.isArray(c.risks) ? c.risks : [])
+  const allRisks = [...mergeRisks(state.risks || [], state.open_findings), ...childRisks]
+  const seenRisks = new Set<string>()
+  const risks = allRisks.filter((r: any) => {
+    const key = `${r.subsystem || ""}:${r.id}@${r.round ?? ""}`
+    if (seenRisks.has(key)) return false
+    seenRisks.add(key)
+    return true
+  }).map(
+    (r: any) => `| ${r.id}${r.subsystem ? ` (${r.subsystem})` : ""} | ${r.severity} | ${r.category} | ${r.accepted_by} | ${cell(r.claim).slice(0, 120)} |`,
   )
   const escs: any[] = state.escalations?.length ? state.escalations : state.escalation ? [state.escalation] : []
   return `# Open Issues
@@ -1217,6 +1259,11 @@ export function summarize(state: any) {
     requirements: { version: state.requirements.version, frozen: state.requirements.frozen, count: state.requirements.items.length },
     decisions: state.decisions.map((d: any) => ({ id: d.id, status: d.status, supersede_count: d.supersede_count })),
     evidence_count: state.evidence.length,
+    suspect_evidence: (state.evidence || []).filter((e: any) => !!e.suspect).length,
+    delivery_pending: (state.escalations?.length ? state.escalations : state.escalation ? [state.escalation] : []).filter(
+      (e: any) => e?.status === "pending_user_ratification" && e?.notified !== true,
+    ).length,
+    held_findings: state.open_findings.filter((f: any) => f.held === true && !["resolved", "accepted_risk"].includes(f.status)).length,
     open_findings: state.open_findings
       .filter((f: any) => !["resolved", "accepted_risk"].includes(f.status))
       .map((f: any) => ({ id: f.id, severity: f.severity, status: f.status, contested: f.contested === true, regression: f.regression })),

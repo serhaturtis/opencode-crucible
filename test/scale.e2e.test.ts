@@ -1230,6 +1230,51 @@ test("a session prompt failure drops the dead session and re-dispatches", async 
   }
 })
 
+test("an escalation is not marked delivered when the Referee prompt fails", async () => {
+  let fail = true
+  const { dir, hooks, call, j } = await harness({}, {
+    promptError: (args: any) => (fail && promptText(args).includes("needing the user's decision") ? new Error("delivery failed") : null),
+  })
+  try {
+    await readyRun(call, "deliv")
+    await fs.writeFile(path.join(dir, "docs", "design", "deliv", "03-architecture.md"), Array.from({ length: 600 }, (_, i) => `l${i}`).join("\n"))
+    await call("design_respond", { slug: "deliv", response_json: JSON.stringify({ round: 0, design_revision: "v1", responses: [] }) })
+    const st = await readState(dir, "deliv")
+    const esc = st.escalations.find((e: any) => e.requirement_id === "spec-budget")
+    expect(esc.notified).toBe(false)
+    expect(esc.delivery_error).toContain("referee prompt failed")
+    // The state is still visible to the Referee; it is simply not advertised as delivered.
+    expect(j(await call("design_status", { slug: "deliv" })).escalations.some((e: any) => e.requirement_id === "spec-budget")).toBe(true)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a recorded artifact with a masked exit or contradictory output is flagged", async () => {
+  const { dir, hooks, call, j } = await harness()
+  try {
+    await readyRun(call, "evid")
+    const rec = j(await call("design_record_evidence", {
+      slug: "evid",
+      class: "authoritative",
+      command: "check.sh; echo exit:$?",
+      output: "SOME CHECKS FAILED",
+      exit_code: 0,
+      artifact_ref: "03-architecture.md#check",
+    }))
+    expect(rec.suspect).toContain("masked")
+    const st = await readState(dir, "evid")
+    expect(st.evidence[0].suspect).toContain("masked")
+    expect(st.evidence[0].commit).toBe(null)
+    expect(st.evidence[0].recorded_by).toBe("referee")
+    expect(j(await call("design_status", { slug: "evid" })).suspect_evidence).toBe(1)
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("a subsystem that stalls out blocks its root, and the retry prompt nudges the agent", async () => {
   const { dir, client, hooks, call, emit } = await harness()
   try {
@@ -1806,7 +1851,8 @@ test("a weak rebuttal keeps gating and is put to the user; reopen re-runs the la
     const f1 = st.open_findings.find((f: any) => f.id === "F-1")
     expect(f1.contested).toBe(true)
     expect(st.history[0].gate).toBe(1)
-    expect(st.escalations.some((e: any) => e.requirement_id === "F-1")).toBe(true)
+    const esc = st.escalations.find((e: any) => e.requirement_id === "F-1")
+    expect(esc.notified).toBe(true)
     expect(client.prompts.some((p: any) => p.sessionID === ctx.sessionID && promptText(p).includes("F-1"))).toBe(true)
     // Reopening a noise finding re-runs the ladder (it stays noise).
     await call("design_decide", { slug: "weak", finding_id: "F-2", decision: "resolved" })
@@ -1849,6 +1895,41 @@ test("a live turn's activity is persisted for the TUI", async () => {
     await emit({ type: "session.text.delta", data: { sessionID: child, delta: "x" } })
     await sleep(50)
     expect((await readState(dir, "hb")).dispatch.last_activity_at).toBeTruthy()
+  } finally {
+    await hooks.dispose?.()
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("first activity starts the dispatch and publishes the active inactivity window", async () => {
+  const { dir, hooks, call, emit } = await harness({ watchdogMs: 120, watchdogSweepMs: 25, heartbeatMs: 10 })
+  try {
+    await readyRun(call, "live")
+    await call("design_dispatch", { slug: "live" })
+    let st = await readState(dir, "live")
+    const child = st.dispatch.child_session_id
+    expect(st.dispatch.started).toBe(false)
+    expect(st.dispatch.watchdog_ms).toBe(120)
+
+    // A missed busy event must not leave started false when activity is observed.
+    await emit({ type: "session.text.delta", data: { sessionID: child, delta: "x" } })
+    await sleep(50)
+    st = await readState(dir, "live")
+    expect(st.dispatch.started).toBe(true)
+    expect(st.dispatch.last_activity_at).toBeTruthy()
+    expect(st.dispatch.watchdog_ms).toBe(120)
+
+    // While a tool runs, the TUI reads the same 30-minute window as the watchdog.
+    await emit({ type: "session.tool.input.started", data: { sessionID: child, id: "tool-1" } })
+    await sleep(50)
+    st = await readState(dir, "live")
+    expect(st.dispatch.watchdog_ms).toBe(30 * 60 * 1000)
+
+    // Completion restores the run's base window.
+    await emit({ type: "session.tool.success", data: { sessionID: child, id: "tool-1" } })
+    await sleep(50)
+    st = await readState(dir, "live")
+    expect(st.dispatch.watchdog_ms).toBe(120)
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })
@@ -2059,9 +2140,21 @@ test("root hand-off lists subsystem loose ends", async () => {
     await call("design_decompose", { slug: "solo", decomposition_json: JSON.stringify(soloManifest) })
     const child = await readState(dir, "solo--svc")
     child.open_findings = [{ id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold" }]
+    child.risks = [{ id: "SVC-F-002", severity: "major", category: "data", accepted_by: "accept_risk", claim: "accepted at the subsystem" }]
     await writeState(dir, "solo--svc", child)
+    await call("design_decompose", { slug: "solo", decomposition_json: JSON.stringify(soloManifest) })
+    const root = await readState(dir, "solo")
+    expect(root.children[0].findings).toEqual([
+      { id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold", subsystem: "SVC" },
+    ])
+    expect(root.children[0].risks).toEqual([
+      { id: "SVC-F-002", severity: "major", category: "data", accepted_by: "accept_risk", claim: "accepted at the subsystem", subsystem: "SVC" },
+    ])
     const h = JSON.parse(await call("design_get_context", { slug: "solo", role: "falsifier" }))
-    expect(h.subsystem_loose_ends).toEqual([{ subsystem: "SVC", id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold" }])
+    expect(h.subsystem_loose_ends).toEqual([
+      { subsystem: "SVC", id: "SVC-F-001", severity: "minor", category: "failure", status: "advisory", claim: "orphaned hold" },
+      { subsystem: "SVC", id: "SVC-F-002", severity: "major", category: "data", status: "accepted_risk", claim: "accepted at the subsystem" },
+    ])
   } finally {
     await hooks.dispose?.()
     await fs.rm(dir, { recursive: true, force: true })

@@ -47,10 +47,22 @@ describe("crucible tui run grouping", () => {
     expect(isVisible(liveChild, null, {})).toBe(true)
 
     const attention = groupEfforts([run("paused", "designing", null, {
-      escalations: [{ status: "pending_user_ratification" }],
+      escalations: [{ status: "pending_user_ratification", notified: true }],
     })])[0]
     expect(needsYou(attention.runs[0].state)).toBe(true)
     expect(isVisible(attention, null, {})).toBe(true)
+
+    const undelivered = groupEfforts([run("undelivered", "converged", null, {
+      escalations: [{ status: "pending_user_ratification", notified: false }],
+    })])[0]
+    expect(isVisible(undelivered, null, {})).toBe(true)
+  })
+
+  test("an escalation that was not delivered is not a needs-you run", () => {
+    const undelivered = groupEfforts([run("pending", "designing", null, {
+      escalations: [{ status: "pending_user_ratification", notified: false }],
+    })])[0]
+    expect(needsYou(undelivered.runs[0].state)).toBe(false)
   })
 
   test("an explicit show or hide always wins", () => {
@@ -64,7 +76,7 @@ describe("crucible tui run grouping", () => {
   test("sorts the current effort first, then attention, and counts the hidden rest", () => {
     const efforts = groupEfforts([
       run("old", "converged", null, {}, 100),
-      run("attention", "designing", null, { escalations: [{ status: "pending_user_ratification" }] }, 50),
+      run("attention", "designing", null, { escalations: [{ status: "pending_user_ratification", notified: true }] }, 50),
       run("current", "designing", null, {}, 10),
     ])
     expect(sortEfforts(efforts, "current").map((e) => e.root)).toEqual(["current", "attention", "old"])
@@ -103,8 +115,22 @@ describe("crucible tui run grouping", () => {
     const effort = groupEfforts([
       run("root", "converged"),
       run("root--live", "designing", "root"),
-      run("root--need", "converged", "root", { escalations: [{ status: "pending_user_ratification" }] }),
+      run("root--need", "converged", "root", { escalations: [{ status: "pending_user_ratification", notified: true }] }),
     ])[0]
     expect(effortLead(effort).slug).toBe("root--need")
+  })
+
+  test("an undelivered question still leads its effort and ranks above settled work", () => {
+    const effort = groupEfforts([
+      run("root", "converged"),
+      run("root--pending", "converged", "root", { escalations: [{ status: "pending_user_ratification", notified: false }] }),
+      run("root--live", "designing", "root"),
+    ])[0]
+    expect(effortLead(effort).slug).toBe("root--pending")
+    const efforts = groupEfforts([
+      run("old", "converged", null, {}, 100),
+      run("pending", "converged", null, { escalations: [{ status: "pending_user_ratification", notified: false }] }, 50),
+    ])
+    expect(sortEfforts(efforts, null).map((e) => e.root)).toEqual(["pending", "old"])
   })
 })

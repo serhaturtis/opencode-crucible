@@ -26,8 +26,14 @@ export function escalations(s: any): any[] {
   return s?.escalation ? [s.escalation] : []
 }
 
+// "Needs you" means the Referee question was actually delivered, not merely that a
+// decision may be required. An undelivered escalation is retried by the server.
 export function needsYou(s: any): boolean {
-  return escalations(s).some((e: any) => e?.status === "pending_user_ratification")
+  return escalations(s).some((e: any) => e?.status === "pending_user_ratification" && e?.notified === true)
+}
+
+export function deliveryPending(s: any): boolean {
+  return escalations(s).some((e: any) => e?.status === "pending_user_ratification" && e?.notified !== true)
 }
 
 export function isTerminal(run: Run) {
@@ -74,18 +80,21 @@ export function groupEfforts(runs: Run[]): Effort[] {
 export function effortLead(effort: Effort): Run {
   return (
     effort.runs.find((r) => needsYou(r.state)) ||
+    effort.runs.find((r) => deliveryPending(r.state)) ||
     effort.runs.find((r) => !isTerminal(r)) ||
     effort.rootRun ||
     effort.runs[0]
   )
 }
 
-// Current effort first, then efforts that need the user, then most recently touched.
+// Current effort first, then delivered questions, then undelivered questions, then the
+// most recently touched. An undelivered question still needs the user to look at it.
 export function sortEfforts(efforts: Effort[], currentSlug: string | null): Effort[] {
   const rank = (effort: Effort) => {
     if (currentSlug && effort.runs.some((r) => r.slug === currentSlug)) return 0
     if (effort.runs.some((r) => needsYou(r.state))) return 1
-    return 2
+    if (effort.runs.some((r) => deliveryPending(r.state))) return 2
+    return 3
   }
   return [...efforts].sort((a, b) => rank(a) - rank(b) || b.mtime - a.mtime)
 }
@@ -114,7 +123,7 @@ export function isVisible(effort: Effort, currentSlug: string | null, prefs: Vis
   if (pref === "hide") return false
   if (pref === "show") return true
   if (currentSlug && effort.runs.some((r) => r.slug === currentSlug)) return true
-  return effort.runs.some((r) => !isTerminal(r) || needsYou(r.state))
+  return effort.runs.some((r) => !isTerminal(r) || needsYou(r.state) || deliveryPending(r.state))
 }
 
 export function partitionEfforts(efforts: Effort[], currentSlug: string | null, prefs: Visibility) {

@@ -56,6 +56,8 @@ import {
   recentlyExamined,
   adjudicationWhy,
   looseEnds,
+  mergeRisks,
+  evidenceProblem,
 } from "./core"
 import { PROTOCOL } from "./protocol"
 import { enqueueEvent } from "./events"
@@ -102,7 +104,7 @@ function api(dir: string) {
 }
 
 // child session id -> the last time it showed activity, plus where its run lives.
-const watchdogs = new Map<string, { last: number; persisted: number; dir: string; slug: string; timeout: number; tools: Set<string>; waiting: boolean }>()
+const watchdogs = new Map<string, { last: number; persisted: number; dir: string; slug: string; timeout: number; tools: Set<string>; waiting: boolean; started: boolean }>()
 const lastCompacted = new Map<string, number>()
 const advancing = new Set<string>()
 const chains = new Map<string, Promise<any>>()
@@ -535,6 +537,23 @@ function shellResult(result: any): { output: string; exit: number | null } {
   return { output: content, exit: exitOf(result?.metadata) }
 }
 
+// Best-effort git identity for an evidence record. Never fails the record; a missing
+// repository or git binary just leaves the fields null.
+function gitRevision(dir: string): { commit: string | null; tag: string | null } {
+  try {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()
+    let tag: string | null = null
+    try {
+      tag = execFileSync("git", ["describe", "--tags", "--exact-match"], { cwd: dir, encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim() || null
+    } catch {
+      tag = null
+    }
+    return { commit: commit || null, tag }
+  } catch {
+    return { commit: null, tag: null }
+  }
+}
+
 async function callerRun(dir: string, sessionID: string | undefined) {
   if (!sessionID) return null
   for (const r of await boundRunsIn(dir, sessionID)) {
@@ -608,6 +627,20 @@ async function buildChildren(dir: string, root: any) {
       round: child.round,
       acceptance_blocked_by_parent: child.acceptance_blocked_by_parent || null,
       untraced_must: (child.requirements?.items || []).filter((r: any) => r.priority === "must" && !(r.system_reqs && r.system_reqs.length)).length,
+      // A child's accepted risks are part of the root's residual ledger (Warden F-008 class).
+      risks: mergeRisks(child.risks || [], child.open_findings || []).map((r: any) => ({ ...r, subsystem: child.namespace || child.slug })),
+      // Unresolved child findings are residual too: a root's release record must not look
+      // clean while a subsystem still carries an open major/minor.
+      findings: (child.open_findings || [])
+        .filter((f: any) => !["resolved", "accepted_risk"].includes(f?.status))
+        .map((f: any) => ({
+          id: f.id,
+          severity: f.severity,
+          category: f.category,
+          status: f.status,
+          claim: f.claim,
+          subsystem: child.namespace || child.slug,
+        })),
     })
   }
   return out
@@ -930,16 +963,18 @@ async function ingestDecomposition(dir: string, slug: string, state: any, manife
 }
 
 // Wake the Referee session to put the proceed/cancel question to the user.
-async function promptReferee(dir: string, sessionId: string | null | undefined, text: string) {
+async function promptReferee(dir: string, sessionId: string | null | undefined, text: string): Promise<boolean> {
   const client = api(dir)
-  if (!client?.session?.prompt || !sessionId) return
+  if (!client?.session?.prompt || !sessionId) return false
   try {
     await ensureRefereeAgent(client, sessionId)
     await client.session.prompt({
       sessionID: sessionId,
       text: `You are acting as the Crucible Referee. ${text}`,
     })
+    return true
   } catch {
+    return false
   }
 }
 
@@ -1043,10 +1078,12 @@ async function refreshTitle(dir: string, state: any) {
 }
 
 // User-facing notice; the TUI plugin tails the file and shows a toast.
-async function notify(dir: string, message: string, variant: string) {
+async function notify(dir: string, message: string, variant: string): Promise<boolean> {
   try {
     await fs.appendFile(notificationsFile(), JSON.stringify({ at: nowIso(), dir, message, variant }) + "\n")
+    return true
   } catch {
+    return false
   }
 }
 
@@ -1083,23 +1120,24 @@ async function notifyEscalations(dir: string, state: any) {
   if (!pending.length) return
   const fresh = pending.filter((e: any) => e.notified !== true)
   if (!fresh.length) return
-  for (const e of fresh) e.notified = true
-  const more = pending.length > 1 ? ` (+${pending.length - 1} more)` : ""
-  await notify(dir, `Crucible ${state.slug} needs you: ${fresh[0].reason}${more}`, "warning")
-
+  const more = fresh.length > 1 ? ` (+${fresh.length - 1} more)` : ""
   const sessionId = await refereeSessionId(dir, state)
-  if (!sessionId) return
-  const lines = pending
+  if (!sessionId) {
+    for (const e of fresh) e.delivery_error = "no referee session"
+    await notify(dir, `Crucible ${state.slug}: ${fresh.length} decision(s) pending, but no Referee session is available`, "warning")
+    return
+  }
+  const lines = fresh
     .map((e: any) => {
       const f = isFindingEscalation(e) ? (state.open_findings || []).find((x: any) => x.id === e.requirement_id) : null
       const detail = f ? `${f.severity} ${f.category}${f.status === "needs_adjudication" ? ` (${adjudicationWhy(f)})` : ""}: ${String(f.claim).slice(0, 140)}` : e.reason
       return `- [${state.slug}] ${e.requirement_id} (${f ? "finding" : "notice"}): ${detail}`
     })
     .join("\n")
-  await promptReferee(
+  const delivered = await promptReferee(
     dir,
     sessionId,
-    `Crucible run '${state.slug}' has ${pending.length} item(s) needing the user's decision:\n${lines}\n\n` +
+    `Crucible run '${state.slug}' has ${fresh.length} new item(s) needing the user's decision:\n${lines}\n\n` +
       `Call the question tool NOW — do not only describe it in text. Ask one question per item. For a finding, offer ` +
       `"Ratify as resolved", "Accept the risk", "Reopen", "Leave for now", and for each item the user decides call ` +
       `design_decide with { finding_id, decision: "resolved" | "accepted_risk" | "reopen" }. For a notice (not a finding), ` +
@@ -1107,6 +1145,19 @@ async function notifyEscalations(dir: string, state: any) {
       `"accepted_risk" } and silences it until its situation changes (it does not bypass the gate). Add slug ` +
       `"${state.slug}" if an id is ambiguous. If a ruling changes what a requirement says, amend it with design_amend_requirement. Do not revise the design yourself.`,
   )
+  if (!delivered) {
+    for (const e of fresh) e.delivery_error = "referee prompt failed"
+    await notify(dir, `Crucible ${state.slug}: ${fresh.length} decision(s) pending; the Referee question could not be delivered`, "warning")
+    return
+  }
+  for (const e of fresh) {
+    e.notified = true
+    e.notified_at = nowIso()
+    delete e.delivery_error
+  }
+  // "Needs you" is only advertised after the Referee prompt that carries the question
+  // was accepted by the host. A failed delivery stays visible as delivery pending.
+  await notify(dir, `Crucible ${state.slug} needs you: ${fresh[0].reason}${more}`, "warning")
 }
 
 // --- scheduler -------------------------------------------------------------
@@ -1162,41 +1213,66 @@ function dispatchPrompt(state: any, role: string, first: boolean, opts: { design
 
 function armWatchdog(dir: string, slug: string, childID: string, timeout: number) {
   const now = Date.now()
-  watchdogs.set(childID, { last: now, persisted: now, dir, slug, timeout, tools: new Set(), waiting: false })
+  watchdogs.set(childID, { last: now, persisted: now, dir, slug, timeout, tools: new Set(), waiting: false, started: false })
   startWatchdogSweeper()
 }
 
-// Mark a dispatched child alive; cheap, since it runs on every streamed token.
+// The window the sweeper would use right now: a running tool gets the longer one.
+function activeWindow(w: { timeout: number; tools: Set<string> }) {
+  return w.tools.size ? Math.max(w.timeout, TOOL_WATCHDOG_MS) : w.timeout
+}
+
+// Mark a dispatched child alive; cheap, since it runs on every streamed token. The first
+// activity also marks the turn started even when the busy status event was missed.
 function touchWatchdog(childID: string) {
   const w = watchdogs.get(childID)
   if (!w) return
   const now = Date.now()
   w.last = now
+  if (!w.started) {
+    w.started = true
+    w.persisted = now
+    void persistHeartbeat(w.dir, w.slug, childID, activeWindow(w))
+    return
+  }
   if (now - w.persisted >= heartbeatMs()) {
     w.persisted = now
-    void persistHeartbeat(w.dir, w.slug, childID)
+    void persistHeartbeat(w.dir, w.slug, childID, activeWindow(w))
   }
 }
 
-async function persistHeartbeat(dir: string, slug: string, childID: string) {
+async function persistHeartbeat(dir: string, slug: string, childID: string, fallbackWindow: number) {
   try {
     await withLock(await lockForRun(dir, slug), async () => {
       const state = await readState(dir, slug)
       if (!state?.dispatch || state.dispatch.child_session_id !== childID) return
+      const w = watchdogs.get(childID)
+      state.dispatch.started = true
       state.dispatch.last_activity_at = nowIso()
+      // Read the live tool set at write time so an in-flight heartbeat cannot persist a
+      // stale window that a tool start/stop already replaced.
+      state.dispatch.watchdog_ms = w ? activeWindow(w) : fallbackWindow
       await saveState(dir, state)
     })
   } catch {
   }
 }
 
-// Running tool calls per dispatched child, from the V2 tool lifecycle events.
+// Running tool calls per dispatched child, from the V2 tool lifecycle events. A tool
+// start/stop also persists the window the TUI should use, so its badge tracks the sweeper.
 function noteTool(childID: string, event: any) {
   const w = watchdogs.get(childID)
   const id = event?.data?.id
   if (!w || !id) return
+  const before = w.tools.size > 0
   if (event.type === "session.tool.input.started" || event.type === "session.tool.called") w.tools.add(String(id))
   else if (event.type === "session.tool.success" || event.type === "session.tool.failed") w.tools.delete(String(id))
+  const after = w.tools.size > 0
+  if (before !== after) {
+    w.started = true
+    w.persisted = Date.now()
+    void persistHeartbeat(w.dir, w.slug, childID, activeWindow(w))
+  }
 }
 
 function clearWatchdog(childID: string) {
@@ -1411,6 +1487,8 @@ async function dispatchRole(dir: string, state: any, role: string, retries = 0) 
     retries,
     started: false,
     started_at: nowIso(),
+    // The base inactivity window; tool start/stop updates it for the TUI badge.
+    watchdog_ms: effectiveWatchdogMs(state),
   }
   await saveState(dir, state)
   armWatchdog(dir, state.slug, childID as string, effectiveWatchdogMs(state))
@@ -1567,7 +1645,8 @@ async function onIdle(dir: string, childID: string) {
     const d = state.dispatch
     if (!d || d.child_session_id !== childID) return
     const advanced = state.phase !== d.phase || state.design_revision !== d.revision
-    const started = d.started === true
+    // The in-memory flag covers the window before the first heartbeat write lands.
+    const started = d.started === true || watchdogs.get(childID)?.started === true
     const age = Date.now() - (Date.parse(d.started_at || "") || 0)
     // Ignore an idle that arrives before the turn began (spurious or compaction).
     if (!advanced && !started && age < BUSY_GRACE_MS) return
@@ -2167,6 +2246,12 @@ const DESIGN_RECORD_EVIDENCE = tool({
         }
         if (!output?.trim()) return JSON.stringify({ ok: false, error: "output is required (nothing was captured for this evidence)." }, null, 2)
         const id = nextId(state, "E-", state.evidence)
+        const output_preview = String(output).slice(0, 2000)
+        const revision = gitRevision(ctx.directory)
+        const suspect = evidenceProblem({ command, exit_code: exit_code ?? null, output_preview })
+        // Who recorded it matters: a finding cannot be backed by an artifact the reviewed
+        // party recorded itself. The Referee session is the user side of the run.
+        const recorder = (await callerRun(ctx.directory, ctx.sessionID))?.role || "referee"
         const rec = {
           id,
           class: args.class,
@@ -2174,15 +2259,20 @@ const DESIGN_RECORD_EVIDENCE = tool({
           exit_code: exit_code ?? null,
           captured,
           digest: digest(output),
-          output_preview: String(output).slice(0, 2000),
+          output_preview,
           artifact_ref: args.artifact_ref || null,
           round: state.round,
           at: nowIso(),
+          commit: revision.commit,
+          tag: revision.tag,
+          suspect,
+          recorded_by: recorder,
+          recorded_session: ctx.sessionID || null,
         }
         state.evidence.push(rec)
         await writeJsonAtomic(path.join(designDir(ctx.directory, slug), ".crucible", "evidence", `${id}.json`), { ...rec, output })
         await saveState(ctx.directory, state)
-        return JSON.stringify({ ok: true, id, captured, digest: rec.digest, status: summarize(state) }, null, 2)
+        return JSON.stringify({ ok: true, id, captured, digest: rec.digest, commit: rec.commit, tag: rec.tag, suspect, status: summarize(state) }, null, 2)
       },
       { tool: "design_record_evidence", roles: ["architect", "falsifier"] },
     )
@@ -2901,11 +2991,12 @@ function eventJob(dir: string, event: any): (() => Promise<void>) | null {
 // The work one received bus event triggers (watchdog liveness, tool tracking, runs).
 async function handleBusEvent(dir: string, event: any) {
   const sid = eventSessionID(event)
-  // Real work from a dispatched child resets its inactivity window.
-  if (sid && WATCHDOG_ACTIVITY_EVENTS.has(event.type)) touchWatchdog(sid)
+  // Track the tool set first: the heartbeat persists the window that set implies.
   if (sid && (event.type === "session.tool.input.started" || event.type === "session.tool.called" || event.type === "session.tool.success" || event.type === "session.tool.failed")) {
     noteTool(sid, event)
   }
+  // Real work from a dispatched child resets its inactivity window.
+  if (sid && WATCHDOG_ACTIVITY_EVENTS.has(event.type)) touchWatchdog(sid)
   if (event.type === "permission.asked") enqueueEvent(() => onPermissionAsked(dir, event.data))
   if (sid && event.type === "permission.replied") {
     const w = watchdogs.get(sid)

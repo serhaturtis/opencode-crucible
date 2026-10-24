@@ -13,6 +13,7 @@ import {
   inactivityWindow,
   isVisible,
   needsYou,
+  deliveryPending,
   partitionEfforts,
   sortEfforts,
   subsystemCounts,
@@ -177,7 +178,7 @@ function summary(run: Run, frame: string) {
   const gate = open.filter(gating).length
   const history: any[] = Array.isArray(s.history) ? s.history : []
   const last = history[history.length - 1]
-  const flags = `${s.paused ? " · paused" : ""}${needsYou(s) ? " · NEEDS YOU" : ""}`
+  const flags = `${s.paused ? " · paused" : ""}${needsYou(s) ? " · NEEDS YOU" : ""}${deliveryPending(s) ? " · delivery pending" : ""}`
   // A decompose root's integration rounds have their own budget.
   const base = Number(s.integration_base_round) > 0 ? Number(s.integration_base_round) : 0
   const budget = `${base ? "integration " : ""}${(s.round ?? 0) - base}/${s.budgets?.max_rounds ?? "?"}`
@@ -255,6 +256,7 @@ function Sidebar(context: any, sessionID: string, visibility: any) {
     const compactStatus = (run: Run) => {
       const s = run.state
       if (needsYou(s)) return "needs you"
+      if (deliveryPending(s)) return "delivery pending"
       if (s.paused) return "paused"
       const phase = String(s.phase || "?")
       if (phase === "converged" || phase === "accepted_with_reservations") return "done"
